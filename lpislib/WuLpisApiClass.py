@@ -91,59 +91,52 @@ class WuLpisApi:
 
     # --------------------------- login ---------------------------
 
-    def login(self):
-        # print(f"init time: {datetime.datetime.now()}")
-        self.data = {}
+   def login(self):
+    # Reset
+    self.data = {}
 
-        # open login page
-        r = self.browser.open(self.URL)
-        # LPIS uses comments in markup – strip to simplify xpath
-        html_text = self._read_bytes_to_str(r.read())
-        html_text = re.sub(r"<!--(.|\s|\n)*?-->", "", html_text)
-        tree = html.fromstring(html_text)
+    # Open login page
+    r = self.browser.open(self.URL)
 
-        # form 'login' expected
-        try:
-            self.browser.select_form('login')
-        except mechanize.FormNotFoundError:
-            # try fallback: pick the first form
-            forms = list(self.browser.forms())
-            if not forms:
-                raise RuntimeError("Login form not found on LPIS landing page.")
-            self.browser.form = forms[0]
+    # Select the login form (fallback to first form if name changed)
+    try:
+        self.browser.select_form('login')
+    except mechanize.FormNotFoundError:
+        forms = list(self.browser.forms())
+        if not forms:
+            raise RuntimeError("Login form not found on LPIS landing page.")
+        self.browser.form = forms[0]
 
-        # find username/password input names by accesskey (as in legacy code)
-        usernames = list(set(tree.xpath("//input[@accesskey='u']/@name")))
-        passwords = list(set(tree.xpath("//input[@accesskey='p']/@name")))
-        if not usernames or not passwords:
-            raise RuntimeError("Could not locate LPIS username/password fields.")
+    # Read raw BYTES and clean comments as BYTES (important for lxml)
+    raw = r.read()  # bytes
+    cleaned = re.sub(rb"<!--.*?-->", b"", raw, flags=re.S)
 
-        input_username = usernames[0]
-        input_password = passwords[0]
+    # Parse with lxml FROM BYTES to avoid 'Unicode strings with encoding declaration...' error
+    tree = html.fromstring(cleaned)
 
-        self.browser[input_username] = self.username
-        self.browser[input_password] = self.password
-        r = self.browser.submit()
+    # Find username/password input names by accesskey
+    usernames = list(set(tree.xpath("//input[@accesskey='u']/@name")))
+    passwords = list(set(tree.xpath("//input[@accesskey='p']/@name")))
+    if not usernames or not passwords:
+        raise RuntimeError("Could not locate LPIS username/password fields on login page.")
 
-        # after login, URL looks like: https://lpis.wu.ac.at/kdcs/bach-s##/#####/
-        url = r.geturl()
-        if "/" not in url:
-            raise RuntimeError("Unexpected LPIS redirect URL after login.")
-        self.URL_scraped = url[:url.rindex('/') + 1]
+    input_username = usernames[0]
+    input_password = passwords[0]
 
-        self.data = self.URL_scraped
-        # self.save_session()
-        self.status["last_logged_in"] = datetime.datetime.now()
-        return self.data
+    # Fill & submit
+    self.browser[input_username] = self.username
+    self.browser[input_password] = self.password
+    r = self.browser.submit()
 
-    def getResults(self):
-        status = dict(self.status)
-        if "last_logged_in" in status and isinstance(status["last_logged_in"], datetime.datetime):
-            status["last_logged_in"] = status["last_logged_in"].strftime("%Y-%m-%d %H:%M:%S")
-        return {
-            "data": self.data,
-            "status": status
-        }
+    # Extract the base URL after login (e.g., https://lpis.wu.ac.at/kdcs/bach-s##/#####/)
+    url = r.geturl()
+    if "/" not in url:
+        raise RuntimeError("Unexpected LPIS redirect URL after login.")
+    self.URL_scraped = url[:url.rindex('/') + 1]
+
+    self.data = self.URL_scraped
+    self.status["last_logged_in"] = datetime.datetime.now()
+    return self.data
 
     # --------------------------- infos (structure) ---------------------------
 
