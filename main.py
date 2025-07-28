@@ -96,8 +96,10 @@ def get_lpis_client(user: str, pw: str):
 def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
                         cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
     """
-    Parse a PP's LV table quickly and append only matching rows to 'out'.
-    Robust title extraction for LPIS variants. Returns True if cap reached.
+    Parse a PP's LV table quickly and append matching rows to 'out'.
+    Robust title extraction + row-text fallback. Uses OR-match for tokens
+    (improves short queries like 'ja' while cache is building).
+    Returns True if cap reached so caller can stop early.
     """
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
@@ -120,40 +122,35 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
         prof_div = row.select_one(".ver_title div")
         prof = (prof_div.get_text(" ", strip=True) if prof_div else "").strip()
 
-        # -------- ROBUST TITLE EXTRACTION --------
+        # -------- ROBUST TITLE + FALLBACKS --------
         name_td = row.find("td", {"class": "ver_title"})
         title = ""
-        fallback_full = ""
+        cell_full = ""
         if name_td:
-            # Full text in the title cell (often "Prof · Course Title")
-            fallback_full = (name_td.get_text(" ", strip=True) or "").strip()
-
-            # 1) Prefer bare text nodes (outside children), last one tends to be the course title
+            cell_full = (name_td.get_text(" ", strip=True) or "").strip()
+            # Prefer bare text nodes (often the actual title)
             bare_texts = [t.strip() for t in name_td.find_all(string=True, recursive=False) if (t or "").strip()]
             if bare_texts:
                 title = bare_texts[-1]
-
-            # 2) If empty, try a prominent child (a/strong/span)
+            # Else try prominent child
             if not title:
                 el = name_td.select_one("a, strong, span")
                 if el:
                     title = (el.get_text(" ", strip=True) or "").strip()
-
-            # 3) If the cell equals the prof (happens on some layouts), remove prof and clean
+            # If title equals prof, drop it
             if title and prof and _norm(title) == _norm(prof):
                 title = ""
-
-            # 4) Last resort: compute title from full cell text minus prof suffix
-            if (not title) and fallback_full:
-                if prof and fallback_full.lower().endswith(prof.lower()):
-                    title = re.sub(re.escape(prof) + r"\s*$", "", fallback_full).strip(" -·•\u00A0")
+            # Last resort: strip trailing prof from full cell
+            if (not title) and cell_full:
+                if prof and cell_full.lower().endswith(prof.lower()):
+                    title = re.sub(re.escape(prof) + r"\s*$", "", cell_full).strip(" -·•\u00A0")
                 else:
-                    title = fallback_full
-
-            # 5) Normalize excess spaces
+                    title = cell_full
             title = re.sub(r"\s+", " ", title or "").strip()
-        # ----------------------------------------
+        # If no ver_title cell, at least use whole row text as a haystack
+        row_text = (row.get_text(" ", strip=True) or "").strip()
 
+        # status/capacity/wl
         status_div = row.select_one("td.box div")
         status = (status_div.get_text(" ", strip=True) if status_div else None)
 
@@ -176,11 +173,11 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             span = wl_div.find("span")
             waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
 
-        # ---- matching (allowing provisional filters to work) ----
+        # ---- matching (OR across tokens; include row_text as fallback haystack) ----
         if tokens:
-            hay = " ".join(filter(None, [title, prof, lv_id, fallback_full]))
+            hay = " ".join(filter(None, [title, prof, lv_id, cell_full, row_text]))
             hay_n = _norm(hay)
-            if not all(t in hay_n for t in tokens):
+            if not any(t in hay_n for t in tokens):  # OR instead of AND for speed/provisional
                 continue
 
         out.append({
@@ -193,6 +190,8 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             "capacity": cap_val,
             "free": free_val,
             "waitlist": waitlist,
+            # optional: keep raw haystack for diagnostics (harmless extra field)
+            "raw": row_text,
         })
 
         if cap and len(out) >= cap:
