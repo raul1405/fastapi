@@ -5,16 +5,11 @@ import os
 import re
 import pickle
 import datetime
-import socket
 from typing import Any, Dict
 
 import mechanize
 from bs4 import BeautifulSoup
 from lxml import html
-
-# Hard-cap each HTTP call so mechanize can't hang forever.
-# Tune between 3–8 seconds depending on LPIS responsiveness.
-socket.setdefaulttimeout(6)
 
 
 class WuLpisApi:
@@ -335,6 +330,7 @@ class WuLpisApi:
                         ver_id_link = lv.select_one(".ver_id a")
                         if not ver_id_link:
                             continue
+                        number = (ver_id_link.text or "").strip()
                         number = self._clean_text(ver_id_link.text)
                         if not number:
                             continue
@@ -345,21 +341,32 @@ class WuLpisApi:
 
                         # semester (e.g., "WiSe 2025", "SoSe 2025", etc.)
                         sem_span = lv.select_one(".ver_id span")
+                        cur["semester"] = (sem_span.text or "").strip() if sem_span else None
                         cur["semester"] = self._clean_text(sem_span.text) if sem_span else None
 
                         # lecturer(s)
                         prof_div = lv.select_one(".ver_title div")
+                        cur["prof"] = (prof_div.text or "").strip() if prof_div else ""
                         cur["prof"] = self._clean_text(prof_div.get_text(" ", strip=True) if prof_div else "")
 
                         # --- robust course title extraction ---
                         name_td = lv.find("td", {"class": "ver_title"})
                         title_text = ""
                         if name_td:
+                            # text nodes not inside children
+                            name_texts = [t for t in name_td.find_all(text=True, recursive=False)]
+                            if len(name_texts) > 1:
+                                cur["name"] = (name_texts[1] or "").strip()
+                            elif len(name_texts) == 1:
+                                cur["name"] = (name_texts[0] or "").strip()
                             # Prefer a clear title element; else fallback to the whole cell text
                             title_el = name_td.select_one("a, strong, span")
                             if title_el:
                                 title_text = self._clean_text(title_el.get_text(" ", strip=True))
                             else:
+                                cur["name"] = ""
+                        else:
+                            cur["name"] = ""
                                 title_text = self._clean_text(name_td.get_text(" ", strip=True))
 
                             # If lecturer text appears inside the same cell, strip it from the end
@@ -378,14 +385,19 @@ class WuLpisApi:
 
                         # status
                         status_div = lv.select_one("td.box div")
+                        cur["status"] = (status_div.text or "").strip() if status_div else None
                         cur["status"] = self._clean_text(status_div.text) if status_div else None
 
                         # capacity/free (format like "x / y")
                         cap_div = lv.select_one('div[class*="capacity_entry"]')
+                        cap_txt = (cap_div.text or "").strip() if cap_div else ""
+                        # format "x / y" → parse defensively
                         cap_txt = self._clean_text(cap_div.text) if cap_div else ""
                         try:
                             slash = cap_txt.rindex("/")
                             free = cap_txt[:slash].strip()
+                            cap = cap_txt[slash + 1 :].strip()
+                            # remove non-digits before int()
                             cap = cap_txt[slash + 1:].strip()
                             cur["free"] = int(re.sub(r"[^\d]", "", free)) if free else None
                             cur["capacity"] = int(re.sub(r"[^\d]", "", cap)) if cap else None
@@ -402,6 +414,7 @@ class WuLpisApi:
 
                         # registration time window
                         ts_span = lv.select_one("td.action .timestamp span")
+                        date_txt = (ts_span.text or "").strip() if ts_span else ""
                         date_txt = self._clean_text(ts_span.text) if ts_span else ""
                         if date_txt.startswith("ab "):
                             cur["date_start"] = date_txt[3:].strip()
@@ -411,12 +424,14 @@ class WuLpisApi:
                         # already registered?
                         reg_box = lv.select_one("td.box.active .timestamp span")
                         if reg_box and reg_box.text:
+                            cur["registered_at"] = reg_box.text.strip()
                             cur["registered_at"] = self._clean_text(reg_box.text)
 
                         # waitlist present?
                         wl_div = lv.select_one('td.capacity div[title*="Anzahl Warteliste"]')
                         if wl_div:
                             span = wl_div.find("span")
+                            cur["waitlist"] = (span.text or "").strip() if span else (wl_div.text or "").strip()
                             cur["waitlist"] = self._clean_text(span.text if span else wl_div.text)
 
         self.data["pp"] = pp
