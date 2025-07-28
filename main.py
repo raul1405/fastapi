@@ -1,26 +1,33 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+# ---------- Input models
 class SearchIn(BaseModel):
     username: str
     password: str
     q: str
     limit: Optional[int] = 20
 
+# ---------- wu-lpis-api client loader (handles different export names)
 def make_lpis_client(user: str, pw: str):
-    """
-    Versucht, die WuLpisApi aus verschiedenen Modulpfaden zu importieren –
-    je nach Version heißt die Klasse/Datei leicht anders.
-    """
     try:
-        from wu_lpis_api.WuLpisApiClass import WuLpisApi  # häufige Variante
+        from wu_lpis_api.WuLpisApiClass import WuLpisApi  # common path
         return WuLpisApi(user, pw, args=None, sessiondir=None)
     except Exception:
         try:
-            from wu_lpis_api import WuLpisApi
+            from wu_lpis_api import WuLpisApi  # fallback export
             return WuLpisApi(user, pw, args=None, sessiondir=None)
         except Exception as e:
             raise RuntimeError(f"wu-lpis-api not importable: {e}")
@@ -29,8 +36,8 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
     items: List[Dict[str, Any]] = []
     data = (result or {}).get("data") or {}
     pp_map = data.get("pp") or {}
-
     q_lower = (q or "").strip().lower()
+
     for pp_id, pp_obj in pp_map.items():
         lvs = (pp_obj or {}).get("lvs") or {}
         for lv_id, lv in lvs.items():
@@ -51,7 +58,6 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
                 "free": lv.get("free"),
                 "waitlist": lv.get("waitlist"),
             })
-
             if limit and len(items) >= limit:
                 return items
     return items
@@ -59,16 +65,13 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
-    Loggt sich ins LPIS ein, ruft infos() und filtert LVs nach Suchbegriff.
-    Keine Demo-Daten mehr.
+    Logs in to LPIS via wu-lpis-api, calls infos(), and returns real items.
     """
     try:
         if not p.username or not p.password:
             raise HTTPException(status_code=400, detail="Missing credentials")
 
         client = make_lpis_client(p.username, p.password)
-
-        # je nach Bibliotheksversion:
         res = client.infos()
         if hasattr(client, "getResults"):
             res = client.getResults()
@@ -78,9 +81,5 @@ def courses_search(p: SearchIn):
     except HTTPException:
         raise
     except Exception as e:
-        # 502, damit Frontend klar 'Worker/LPIS Fehler' unterscheiden kann
+        # Forward as 502 so the frontend knows it failed upstream
         raise HTTPException(status_code=502, detail=str(e))
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
