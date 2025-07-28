@@ -111,7 +111,8 @@ class WuLpisApi:
     raw = r.read()  # bytes
     cleaned = re.sub(rb"<!--.*?-->", b"", raw, flags=re.S)
 
-    # Parse with lxml FROM BYTES to avoid 'Unicode strings with encoding declaration...' error
+    # Parse with lxml FROM BYTES to avoid
+    # 'Unicode strings with encoding declaration...' errors
     tree = html.fromstring(cleaned)
 
     # Find username/password input names by accesskey
