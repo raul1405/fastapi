@@ -149,3 +149,32 @@ def debug_structure(p: SearchIn):
         "lv_total": total_lvs,
         "sample_pp_ids": list(pp.keys())[:5],
     }
+
+@app.post("/debug/forms")
+def debug_forms(p: SearchIn):
+    try:
+        from lpislib import WuLpisApi
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
+
+    client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
+    # open post-login base and try to reach overview
+    try:
+        client.ensure_overview()
+    except Exception as e:
+        # If ensure_overview not present because you didn't paste it right:
+        raise HTTPException(status_code=500, detail=f"ensure_overview missing: {e}")
+
+    forms_info = []
+    for frm in client.browser.forms():
+        try:
+            controls = []
+            for c in frm.controls:
+                try:
+                    controls.append(getattr(c, "name", None))
+                except Exception:
+                    controls.append(None)
+            forms_info.append({"name": frm.name, "controls": controls})
+        except Exception:
+            forms_info.append({"name": None, "controls": []})
+    return {"ok": True, "forms": forms_info}
