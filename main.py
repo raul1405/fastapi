@@ -3,124 +3,77 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
-import unicodedata
-import traceback
-import re
-
-from bs4 import BeautifulSoup  # already in your worker env
+import unicodedata, traceback, re, time, threading
+from bs4 import BeautifulSoup  # already in your env
 
 app = FastAPI()
 
+# ---------------- Config ----------------
+INDEX_TTL_SECONDS = 600  # 10 minutes cache TTL; tune as needed
+REBUILD_TIME_BUDGET = 25  # seconds; stop early if taking too long
 
-# ---------- Health & Root ----------
-@app.get("/")
-def root():
-    return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-
-# ---------- Models ----------
+# --------------- Models -----------------
 class SearchIn(BaseModel):
     username: str
     password: str
     q: str = ""
     limit: Optional[int] = 20
 
+class ReindexIn(BaseModel):
+    username: str
+    password: str
+    # optional: restrict to given PP ids to speed up a partial refresh
+    pp_ids: Optional[List[str]] = None
 
-# ---------- Helpers ----------
+# --------------- Cache ------------------
+# CACHE: { username: { "items": List[dict], "updated": float_ts, "building": bool } }
+_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+def _now() -> float:
+    return time.time()
+
+def _is_fresh(entry: Dict[str, Any]) -> bool:
+    return entry and ( _now() - entry.get("updated", 0) ) < INDEX_TTL_SECONDS
+
+# -------------- Text utils --------------
 def _norm(s: str) -> str:
-    """Lowercase, strip accents, collapse whitespace."""
     s = (s or "")
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
-
 def _split_lecturers(prof: str) -> List[str]:
-    """Split lecturer string into a clean list (handles · , ; / |)."""
     if not prof:
         return []
     parts = re.split(r"[·•|,;/]+", prof)
     return [p.strip() for p in parts if p and p.strip()]
 
+def _matches(tokens: List[str], title: str, prof: str, lv_id: str) -> bool:
+    if not tokens:
+        return True
+    hay = " ".join(filter(None, [title, prof, str(lv_id)]))
+    hay_n = _norm(hay)
+    return all(t in hay_n for t in tokens)
 
-def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[Dict[str, Any]]:
-    """
-    Normalize LPIS structure to a flat course list used by the UI (full scrape path).
-    - Matches on course title, lecturer(s), and LV id.
-    - Multi-word query uses AND semantics.
-    - limit=0 or None means 'no cap'.
-    """
-    items: List[Dict[str, Any]] = []
-
-    data = (result or {}).get("data") or result or {}
-    pp_map = data.get("pp") or {}
-    tokens = [_norm(t) for t in (q or "").split() if t]
-
-    def matches(title: str, prof: str, lv_id: str) -> bool:
-        if not tokens:
-            return True
-        hay = " ".join(filter(None, [title, prof, str(lv_id)]))
-        hay_n = _norm(hay)
-        return all(t in hay_n for t in tokens)
-
-    cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else None
-
-    for pp_id, pp_obj in pp_map.items():
-        lvs = (pp_obj or {}).get("lvs") or {}
-        for lv_id, lv in lvs.items():
-            title = (lv or {}).get("name") or ""
-            prof = (lv or {}).get("prof") or ""
-            if not matches(title, prof, str(lv_id)):
-                continue
-
-            items.append({
-                "pp": str(pp_id),
-                "lv": str(lv_id),
-                "title": title,
-                "lecturers": _split_lecturers(prof),
-                "semester": lv.get("semester"),
-                "status": lv.get("status"),
-                "capacity": lv.get("capacity"),
-                "free": lv.get("free"),
-                "waitlist": lv.get("waitlist"),
-            })
-
-            if cap and len(items) >= cap:
-                return items
-    return items
-
-
+# -------------- LPIS client -------------
 def get_lpis_client(user: str, pw: str):
-    """
-    Lazy import WuLpisApi and construct a client.
-    Returns HTTPException with proper codes on failure so callers can propagate.
-    """
     try:
-        from lpislib import WuLpisApi  # vendored package
+        from lpislib import WuLpisApi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
     try:
         return WuLpisApi(user, pw, args=None, sessiondir=None)
     except Exception as e:
-        # Login/redirect/parse errors → treat as upstream failure
         raise HTTPException(status_code=502, detail=str(e))
 
-
-# ---------- FAST PATH ----------
-def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str], cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
-    """
-    Parse a PP's LV table quickly and append only matching rows to 'out'.
-    Returns True if cap reached and caller can stop.
-    """
+# --------- Low-level scraping (fast) ----
+def _parse_lv_table(pp_id: str, soup_lv: BeautifulSoup) -> List[Dict[str, Any]]:
+    rows_out: List[Dict[str, Any]] = []
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
     if not lv_body:
-        return False
+        return rows_out
 
     for row in lv_body.find_all("tr"):
         ver_id_link = row.select_one(".ver_id a")
@@ -130,37 +83,24 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str], c
         if not lv_id:
             continue
 
-        # semester
         sem_span = row.select_one(".ver_id span")
         semester = (sem_span.get_text(" ", strip=True) if sem_span else None)
 
-        # lecturer(s)
         prof_div = row.select_one(".ver_title div")
         prof = (prof_div.get_text(" ", strip=True) if prof_div else "").strip()
 
-        # title (robust)
         name_td = row.find("td", {"class": "ver_title"})
         title = ""
         if name_td:
-            # Prefer an inner title element if present
             title_el = name_td.select_one("a, strong, span")
             title = (title_el.get_text(" ", strip=True) if title_el else name_td.get_text(" ", strip=True)).strip()
             if prof:
                 title = re.sub(re.escape(prof) + r"\s*$", "", title).strip(" -·•\u00A0")
             title = re.sub(r"\s+", " ", title).strip()
 
-        # fast matching (AND over tokens on title+prof+lv_id)
-        if tokens:
-            hay = " ".join(filter(None, [title, prof, lv_id]))
-            hay_n = _norm(hay)
-            if not all(t in hay_n for t in tokens):
-                continue
-
-        # status
         status_div = row.select_one("td.box div")
         status = (status_div.get_text(" ", strip=True) if status_div else None)
 
-        # capacity/free
         cap_div = row.select_one('div[class*="capacity_entry"]')
         free_val, cap_val = (None, None)
         if cap_div:
@@ -174,14 +114,13 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str], c
             except Exception:
                 pass
 
-        # waitlist
         waitlist = None
         wl_div = row.select_one('td.capacity div[title*="Anzahl Warteliste"]')
         if wl_div:
             span = wl_div.find("span")
             waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
 
-        out.append({
+        rows_out.append({
             "pp": str(pp_id),
             "lv": str(lv_id),
             "title": title,
@@ -192,30 +131,19 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str], c
             "free": free_val,
             "waitlist": waitlist,
         })
+    return rows_out
 
-        if cap and len(out) >= cap:
-            return True  # stop early
-    return False
+def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
+    """Full index build for a user account; returns flat list of all LVs."""
+    start = _now()
+    client = get_lpis_client(username, password)
 
-
-def fast_scan(client, query: str, limit: Optional[int]) -> List[Dict[str, Any]]:
-    """
-    FAST path: navigate once to the overview and then open PP LV pages
-    one-by-one, collecting matches and STOPPING when 'limit' is reached.
-    Avoids building the full structure and avoids touching irrelevant PP pages.
-    """
-    tokens = [_norm(t) for t in (query or "").split() if t]
-    cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else None
-    out: List[Dict[str, Any]] = []
-
-    # 1) Ensure we're at the study-plan page and submit the form once
+    # Reach overview and submit once to show PP table
     try:
         client.ensure_overview()
-    except Exception as e:
-        # If ensure_overview not available for some reason, fallback to full path
-        raise
+    except Exception:
+        pass
 
-    # Select study-plan form or any form with ASPP, then submit to get PP table
     selected = False
     try:
         client.browser.select_form("ea_stupl")
@@ -229,7 +157,6 @@ def fast_scan(client, query: str, limit: Optional[int]) -> List[Dict[str, Any]]:
                 break
             except Exception:
                 continue
-
     if not selected:
         raise HTTPException(status_code=502, detail="Could not reach study-plan form (ea_stupl / ASPP).")
 
@@ -242,81 +169,135 @@ def fast_scan(client, query: str, limit: Optional[int]) -> List[Dict[str, Any]]:
     r = client.browser.submit()
     soup = BeautifulSoup(r.read(), "html.parser")
 
-    # 2) Iterate PP rows; for each with lv_url, open LV list and filter quickly.
+    # Iterate PP rows and gather LV rows; stop on time budget
+    items: List[Dict[str, Any]] = []
     table = soup.find("table", {"class": "b3k-data"})
     tbody = table.find("tbody") if table else None
     rows = tbody.find_all("tr") if tbody else []
 
     for planpunkt in rows:
+        if (_now() - start) > REBUILD_TIME_BUDGET:
+            break  # respect rebuild time budget
+
         a_tag = planpunkt.find("a")
         if not (a_tag and a_tag.get("id")):
             continue
-        pp_id = a_tag["id"][1:]  # drop 'S'
+        pp_id = a_tag["id"][1:]
 
         link_lv = planpunkt.select_one('a[href*="DLVO"]')
         if not link_lv:
             continue
-        lv_url_rel = link_lv.get("href", "").strip()
+        lv_url_rel = (link_lv.get("href", "") or "").strip()
         if not lv_url_rel:
             continue
 
-        # Open LV page for this PP and parse only matching rows
         res2 = client.browser.open(client.URL_scraped + lv_url_rel)
         soup_lv = BeautifulSoup(res2.read(), "html.parser")
+        items.extend(_parse_lv_table(pp_id, soup_lv))
 
-        if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
-            break  # cap reached — stop scanning more PP pages
+    return items
 
-    return out
+def _ensure_index(username: str, password: str, force: bool = False):
+    """Ensure we have a (fresh) index; trigger rebuild in background if needed."""
+    with _CACHE_LOCK:
+        entry = _CACHE.get(username)
+        if not force and entry and _is_fresh(entry):
+            return  # already fresh
 
+        # If a rebuild is already running, don't start another
+        if entry and entry.get("building"):
+            return
 
-# ---------- Endpoints ----------
+        if not entry:
+            entry = {"items": [], "updated": 0.0, "building": False}
+            _CACHE[username] = entry
+
+        def _worker():
+            try:
+                entry["building"] = True
+                items = _build_index(username, password)
+                entry["items"] = items
+                entry["updated"] = _now()
+            except Exception:
+                # keep old snapshot on failure
+                pass
+            finally:
+                entry["building"] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+# ---------------- Endpoints ----------------
+
+@app.get("/")
+def root():
+    return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
-    Logs in to LPIS, then:
-      - FAST PATH: if q is non-empty and limit > 0, scan PP pages progressively and stop early.
-      - FULL PATH: otherwise, build full structure and filter.
+    Ultra-fast: returns from cache (ms). If cache is stale/missing, triggers a background rebuild.
+    Query semantics:
+      - AND over tokens; matches title + lecturers + LV id.
+      - limit=0 or None => no cap.
     """
     try:
-        client = get_lpis_client(p.username, p.password)  # may raise HTTPException(500/502)
+        # Kick off a rebuild if needed, but do NOT block the response.
+        _ensure_index(p.username, p.password, force=False)
 
-        use_fast = bool((p.q or "").strip()) and isinstance(p.limit, int) and (p.limit or 0) > 0
-        if use_fast:
-            try:
-                items = fast_scan(client, p.q, p.limit)
-                return {"ok": True, "items": items}
-            except Exception:
-                # If anything odd happens in fast mode, fall back to reliable full mode
-                pass
+        # Read current snapshot
+        with _CACHE_LOCK:
+            entry = _CACHE.get(p.username) or {"items": [], "updated": 0.0, "building": False}
+            items_snapshot = list(entry.get("items", []))
+            updated = entry.get("updated", 0.0)
+            building = bool(entry.get("building"))
 
-        # --- FULL PATH fallback ---
-        if hasattr(client, "infos"):
-            res = client.infos()
-        elif hasattr(client, "getResults"):
-            res = client.getResults()
-        else:
-            raise HTTPException(status_code=500, detail="LPIS client missing both infos() and getResults()")
+        tokens = [_norm(t) for t in (p.q or "").split() if t]
+        cap = int(p.limit) if (isinstance(p.limit, int) and p.limit and p.limit > 0) else None
 
-        items = extract_items(res, p.q, p.limit)
-        return {"ok": True, "items": items}
+        out: List[Dict[str, Any]] = []
+        for it in items_snapshot:
+            if _matches(tokens, it.get("title") or "", " ".join(it.get("lecturers") or []), it.get("lv") or ""):
+                out.append(it)
+                if cap and len(out) >= cap:
+                    break
+
+        return {
+            "ok": True,
+            "items": out,
+            "meta": {
+                "cached": True,
+                "updated_at_unix": updated,
+                "building": building,
+                "fresh": ( _now() - updated ) < INDEX_TTL_SECONDS
+            }
+        }
 
     except HTTPException as he:
         return JSONResponse(status_code=he.status_code, content={"ok": False, "error": he.detail})
     except Exception as e:
         tb = traceback.format_exc(limit=5)
-        return JSONResponse(
-            status_code=500,
-            content={"ok": False, "error": str(e), "trace": tb[:4000]},
-        )
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e), "trace": tb[:4000]})
 
+@app.post("/courses/reindex")
+def courses_reindex(p: ReindexIn):
+    """
+    Force a background reindex for this account. Returns immediately.
+    Frontend can call this right after storing credentials, and a cron can call it every N minutes.
+    """
+    try:
+        _ensure_index(p.username, p.password, force=True)
+        return {"ok": True, "queued": True}
+    except HTTPException as he:
+        return JSONResponse(status_code=he.status_code, content={"ok": False, "error": he.detail})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 @app.post("/debug/structure")
 def debug_structure(p: SearchIn):
-    """
-    TEMP endpoint to introspect what the scraper sees after login.
-    Do not expose publicly in production.
-    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
@@ -328,7 +309,6 @@ def debug_structure(p: SearchIn):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LPIS navigation failed: {e}")
 
-    # Normalize potential structures
     normalized = data
     if hasattr(client, "getResults") and "data" not in normalized:
         try:
@@ -348,20 +328,14 @@ def debug_structure(p: SearchIn):
         "sample_pp_ids": list(pp.keys())[:5],
     }
 
-
 @app.post("/debug/forms")
 def debug_forms(p: SearchIn):
-    """
-    Lists form names and their controls from the current mechanize context after ensure_overview().
-    Helpful when LPIS instances differ in form naming.
-    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
 
     client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
-    # open post-login base and try to reach overview
     try:
         client.ensure_overview()
     except Exception as e:
