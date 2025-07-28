@@ -1,7 +1,8 @@
 fastapi==0.111.0
 uvicorn==0.30.1
 pydantic==2.8.2
-requests
+mechanize
 beautifulsoup4
 lxml
-git+https://github.com/alexanderhofstaetter/wu-lpis-api
+python-dateutil
+requests
