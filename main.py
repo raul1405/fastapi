@@ -8,21 +8,23 @@ import unicodedata
 import traceback
 import threading
 import socket
+import contextlib
 import re
 import time
-import os  # NEW: for /whoami
 
+# ---------- Global network defaults ----------
 # Hard timeouts so requests can't hang forever
-socket.setdefaulttimeout(8)
+socket.setdefaulttimeout(8)  # default for normal paths
 
 app = FastAPI()
 
-# ---------------- Config ----------------
+# ---------- Config ----------
 INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
 REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 900      # ~2s best-effort provisional scan
+PROVISIONAL_TIMEOUT_MS = 2000      # ~2s overall budget for provisional scan
+PROVISIONAL_NET_TIMEOUT = 1.8      # per-request timeout used INSIDE provisional scan
 
-# --------------- Models -----------------
+# ---------- Models ----------
 class SearchIn(BaseModel):
     username: str
     password: str
@@ -32,7 +34,7 @@ class SearchIn(BaseModel):
 class ReindexIn(BaseModel):
     username: str
     password: str
-    pp_ids: Optional[List[str]] = None  # not used yet
+    pp_ids: Optional[List[str]] = None  # reserved
 
 class EnrollIn(BaseModel):
     username: str
@@ -42,8 +44,8 @@ class EnrollIn(BaseModel):
     group_id: Optional[str] = None
     auto_waitlist: bool = True
 
-# --------------- Cache ------------------
-# CACHE: {
+# ---------- In-memory cache ----------
+# _CACHE: {
 #   username: {
 #       "items": List[dict],
 #       "updated": float,
@@ -62,7 +64,7 @@ def _now() -> float:
 def _is_fresh(entry: Dict[str, Any]) -> bool:
     return entry and ((_now() - entry.get("updated", 0.0)) < INDEX_TTL_SECONDS)
 
-# -------------- Text utils --------------
+# ---------- Text utils ----------
 def _norm(s: str) -> str:
     s = (s or "")
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
@@ -82,7 +84,18 @@ def _matches(tokens: List[str], title: str, prof: str, lv_id: str) -> bool:
     hay_n = _norm(hay)
     return all(t in hay_n for t in tokens)  # strict AND
 
-# -------------- LPIS client -------------
+# ---------- Timeout helper for provisional path ----------
+@contextlib.contextmanager
+def _temp_socket_timeout(sec: float):
+    """Temporarily change the global socket default timeout."""
+    old = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(sec)
+        yield
+    finally:
+        socket.setdefaulttimeout(old)
+
+# ---------- LPIS client loader ----------
 def get_lpis_client(user: str, pw: str):
     try:
         from lpislib import WuLpisApi  # vendored client
@@ -93,7 +106,7 @@ def get_lpis_client(user: str, pw: str):
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-# --------- Low-level scraping (fast) ----
+# ---------- Low-level LV table parse (fast) ----------
 def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
                         cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
     """
@@ -121,37 +134,32 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
         prof_div = row.select_one(".ver_title div")
         prof = (prof_div.get_text(" ", strip=True) if prof_div else "").strip()
 
-        # -------- ROBUST TITLE EXTRACTION --------
+        # -------- robust title extraction --------
         name_td = row.find("td", {"class": "ver_title"})
         title = ""
         fallback_full = ""
         if name_td:
-            # Full text in the title cell (often "Prof · Course Title")
             fallback_full = (name_td.get_text(" ", strip=True) or "").strip()
 
-            # 1) Prefer bare text nodes (outside children), last one tends to be the course title
+            # prefer bare text nodes outside children
             bare_texts = [t.strip() for t in name_td.find_all(string=True, recursive=False) if (t or "").strip()]
             if bare_texts:
                 title = bare_texts[-1]
 
-            # 2) If empty, try a prominent child (a/strong/span)
             if not title:
                 el = name_td.select_one("a, strong, span")
                 if el:
                     title = (el.get_text(" ", strip=True) or "").strip()
 
-            # 3) If the cell equals the prof (happens on some layouts), remove prof and clean
             if title and prof and _norm(title) == _norm(prof):
                 title = ""
 
-            # 4) Last resort: compute title from full cell text minus prof suffix
             if (not title) and fallback_full:
                 if prof and fallback_full.lower().endswith(prof.lower()):
                     title = re.sub(re.escape(prof) + r"\s*$", "", fallback_full).strip(" -·•\u00A0")
                 else:
                     title = fallback_full
 
-            # 5) Normalize excess spaces
             title = re.sub(r"\s+", " ", title or "").strip()
         # ----------------------------------------
 
@@ -177,7 +185,7 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             span = wl_div.find("span")
             waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
 
-        # ---- matching (allowing provisional filters to work) ----
+        # ---- matching ----
         if tokens:
             hay = " ".join(filter(None, [title, prof, lv_id, fallback_full]))
             hay_n = _norm(hay)
@@ -200,12 +208,12 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             return True
     return False
 
+# ---------- Full index build (background) ----------
 def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
     """Full index build for a user account; returns flat list of all LVs."""
     start = _now()
     client = get_lpis_client(username, password)
 
-    # Reach overview and submit once to show PP table
     try:
         client.ensure_overview()
     except Exception:
@@ -257,7 +265,10 @@ def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
         if not lv_url_rel:
             continue
 
-        res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+        try:
+            res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+        except Exception:
+            continue
         soup_lv = BeautifulSoup(res2.read(), "html.parser")
         _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=items)
 
@@ -295,147 +306,146 @@ def _ensure_index(username: str, password: str, force: bool = False):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+# ---------- Provisional scan (true fast path) ----------
 def _provisional_scan(username: str, password: str, q: str, limit: Optional[int],
                       timeout_ms: int = PROVISIONAL_TIMEOUT_MS) -> List[Dict[str, Any]]:
     """
-    Quick, best-effort scan for first-time requests so we don't return empty while cache builds.
-    Time-bounded; returns whatever it finds within timeout_ms.
-    PRIORITIZES plan points (PP) whose displayed name matches any query token, so we hit likely
-    matches first within the time budget.
+    Run a quick best-effort scan with a SHORT per-request timeout so the whole
+    operation stays under ~timeout_ms even if LPIS endpoints are slow.
     """
     start = _now()
-    client = get_lpis_client(username, password)
-
-    try:
-        client.ensure_overview()
-    except Exception:
-        pass
-
-    # Reach study-plan form
-    selected = False
-    try:
-        client.browser.select_form("ea_stupl")
-        selected = True
-    except Exception:
-        for frm in client.browser.forms():
-            try:
-                client.browser.form = frm
-                _ = client.browser.form.find_control("ASPP")
-                selected = True
-                break
-            except Exception:
-                continue
-    if not selected:
-        return []
-
-    # Pick first ASPP option
-    try:
-        item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
-        item.selected = True
-    except Exception:
-        pass
-
-    r = client.browser.submit()
-    soup = BeautifulSoup(r.read(), "html.parser")
-
-    # Tokenize query
-    tokens = [_norm(t) for t in (q or "").split() if t]
-    cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
     out: List[Dict[str, Any]] = []
 
-    # Collect all planpunkt rows and compute a priority score
-    table = soup.find("table", {"class": "b3k-data"})
-    tbody = table.find("tbody") if table else None
-    rows = tbody.find_all("tr") if tbody else []
+    with _temp_socket_timeout(PROVISIONAL_NET_TIMEOUT):
+        client = get_lpis_client(username, password)
 
-    candidates = []  # list of (priority, pp_id, lv_url_rel)
-    for planpunkt in rows:
-        if (_now() - start) * 1000 > timeout_ms:
-            break
-
-        a_tag = planpunkt.find("a")
-        if not (a_tag and a_tag.get("id")):
-            continue
-        pp_id = a_tag["id"][1:]  # 'S12345' -> '12345'
-
-        link_lv = planpunkt.select_one('a[href*="DLVO"]')
-        if not link_lv:
-            continue
-        lv_url_rel = (link_lv.get("href", "") or "").strip()
-        if not lv_url_rel:
-            continue
-
-        # Try to read the PP display name (type + name spans)
-        span1 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(1)")
-        span2 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(2)")
-        pp_type = (span1.get_text(" ", strip=True) if span1 else "").strip()
-        pp_name = (span2.get_text(" ", strip=True) if span2 else "").strip()
-        if not pp_name:
-            # fallback: second TD full text
-            second_td = planpunkt.select_one("td:nth-of-type(2)")
-            pp_name = (second_td.get_text(" ", strip=True) if second_td else "").strip()
-
-        # Compute priority: 0 = high if any token matches PP name/type, else 1
-        hay = _norm(" ".join([pp_type, pp_name]))
-        priority = 1
-        if tokens and any(t in hay for t in tokens):
-            priority = 0
-
-        candidates.append((priority, pp_id, lv_url_rel))
-
-    # Sort so we open the most promising PP first
-    candidates.sort(key=lambda x: x[0])
-
-    # Now iterate candidates within time budget
-    for priority, pp_id, lv_url_rel in candidates:
-        if (_now() - start) * 1000 > timeout_ms:
-            break
         try:
-            res2 = client.browser.open(client.URL_scraped + lv_url_rel)
-            soup_lv = BeautifulSoup(res2.read(), "html.parser")
+            client.ensure_overview()
         except Exception:
-            continue
+            pass
 
-        # Parse rows and apply strict AND-match on tokens
-        if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
-            break
+        # Reach study-plan form
+        selected = False
+        try:
+            client.browser.select_form("ea_stupl")
+            selected = True
+        except Exception:
+            for frm in client.browser.forms():
+                try:
+                    client.browser.form = frm
+                    _ = client.browser.form.find_control("ASPP")
+                    selected = True
+                    break
+                except Exception:
+                    continue
+        if not selected:
+            return []
 
-    # If we still have nothing and we have time left, do one relaxed pass (OR-match) on the top PPs
-    if not out and tokens and ((_now() - start) * 1000) <= timeout_ms:
-        # Re-scan top few candidates quickly with OR filter by letting tokens=[] in fast parse,
-        # then OR-filter here in Python.
-        top = candidates[: min(5, len(candidates))]  # small subset
-        for priority, pp_id, lv_url_rel in top:
+        try:
+            item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
+            item.selected = True
+        except Exception:
+            pass
+
+        try:
+            r = client.browser.submit()
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.read(), "html.parser")
+
+        tokens = [_norm(t) for t in (q or "").split() if t]
+        cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
+
+        table = soup.find("table", {"class": "b3k-data"})
+        tbody = table.find("tbody") if table else None
+        rows = tbody.find_all("tr") if tbody else []
+
+        candidates = []  # (priority, pp_id, lv_url_rel)
+        for planpunkt in rows:
+            if (_now() - start) * 1000 > timeout_ms:
+                break
+
+            a_tag = planpunkt.find("a")
+            if not (a_tag and a_tag.get("id")):
+                continue
+            pp_id = a_tag["id"][1:]
+
+            link_lv = planpunkt.select_one('a[href*="DLVO"]')
+            if not link_lv:
+                continue
+            lv_url_rel = (link_lv.get("href", "") or "").strip()
+            if not lv_url_rel:
+                continue
+
+            span1 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(1)")
+            span2 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(2)")
+            pp_type = (span1.get_text(" ", strip=True) if span1 else "").strip()
+            pp_name = (span2.get_text(" ", strip=True) if span2 else "").strip()
+            if not pp_name:
+                second_td = planpunkt.select_one("td:nth-of-type(2)")
+                pp_name = (second_td.get_text(" ", strip=True) if second_td else "").strip()
+
+            hay = _norm(" ".join([pp_type, pp_name]))
+            priority = 1
+            if tokens and any(t in hay for t in tokens):
+                priority = 0
+
+            candidates.append((priority, pp_id, lv_url_rel))
+
+        candidates.sort(key=lambda x: x[0])
+        # open only a few PP pages in provisional
+        if tokens:
+            candidates = candidates[:3]
+        else:
+            candidates = candidates[:2]
+
+        for priority, pp_id, lv_url_rel in candidates:
             if (_now() - start) * 1000 > timeout_ms:
                 break
             try:
-                res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+                # mechanize.Browser.open may accept timeout; guard fallback
+                try:
+                    res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PROVISIONAL_NET_TIMEOUT)
+                except TypeError:
+                    res2 = client.browser.open(client.URL_scraped + lv_url_rel)
                 soup_lv = BeautifulSoup(res2.read(), "html.parser")
             except Exception:
                 continue
 
-            tmp: List[Dict[str, Any]] = []
-            # collect without filtering, then OR-filter locally
-            _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=tmp)
-
-            # OR-filter
-            for it in tmp:
-                hay = _norm(" ".join(filter(None, [
-                    it.get("title") or "",
-                    " ".join(it.get("lecturers") or []),
-                    str(it.get("lv") or "")
-                ])))
-                if any(t in hay for t in tokens):
-                    out.append(it)
-                    if cap and len(out) >= cap:
-                        break
-            if cap and len(out) >= cap:
+            if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
                 break
+
+        # relaxed OR pass (very small) if still empty and time left
+        if not out and tokens and ((_now() - start) * 1000) <= timeout_ms:
+            for priority, pp_id, lv_url_rel in candidates[:2]:
+                if (_now() - start) * 1000 > timeout_ms:
+                    break
+                try:
+                    try:
+                        res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PROVISIONAL_NET_TIMEOUT)
+                    except TypeError:
+                        res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+                    soup_lv = BeautifulSoup(res2.read(), "html.parser")
+                except Exception:
+                    continue
+
+                tmp: List[Dict[str, Any]] = []
+                _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=tmp)
+
+                for it in tmp:
+                    hay = _norm(" ".join(filter(None, [
+                        it.get("title") or "",
+                        " ".join(it.get("lecturers") or []),
+                        str(it.get("lv") or "")
+                    ])))
+                    if any(t in hay for t in tokens):
+                        out.append(it)
+                        if cap and len(out) >= cap:
+                            break
 
     return out
 
-# -------- Enrollment helpers ----------
-
+# ---------- Enrollment helpers ----------
 def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
     """
     After login/ensure_overview(): show plan table and open DLVO page for given PP.
@@ -646,8 +656,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
         "debug": {"snippet": snippet, "forms": forms}
     }
 
-# ---------------- Endpoints ----------------
-
+# ---------- Endpoints ----------
 @app.get("/")
 def root():
     return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
@@ -656,20 +665,14 @@ def root():
 def healthz():
     return {"ok": True}
 
-# NEW: simple process identity endpoint to diagnose split cache / multiple replicas
-@app.get("/whoami")
-def whoami():
-    return {"pid": os.getpid(), "time": time.time()}
-
-# ------ SEARCH (cache + provisional + relaxed + direct fallback) ------
+# --- SEARCH (cache + provisional + relaxed fallback) ---
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
     Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
-    - run ~900ms provisional scan,
+    - run ~2s provisional scan (with per-call timeout),
     - then try a relaxed OR-match on cache,
-    - finally a broad provisional scan and OR-filter (final fallback),
-    - and if still empty, DO A DIRECT infos() FETCH (pre-enroll behavior) to guarantee results.
+    - finally a broad provisional scan and OR-filter (fallback).
     """
     try:
         _ensure_index(p.username, p.password, force=False)
@@ -716,6 +719,7 @@ def courses_search(p: SearchIn):
                     " ".join(it.get("lecturers") or []),
                     str(it.get("lv") or "")
                 ]))
+            # normalize once
                 hay_n = _norm(hay)
                 if any(t in hay_n for t in tokens):   # OR instead of AND
                     relaxed.append(it)
@@ -746,62 +750,6 @@ def courses_search(p: SearchIn):
                         out = filtered
             except Exception as e:
                 prov_error = prov_error or str(e)
-
-        # NEW: Pass 4 — DIRECT infos() fallback to guarantee results (pre-enroll behavior)
-        if not out:
-            try:
-                client = get_lpis_client(p.username, p.password)
-                # Prefer infos(); fallback to getResults()
-                if hasattr(client, "infos"):
-                    res = client.infos()
-                elif hasattr(client, "getResults"):
-                    res = client.getResults()
-                else:
-                    raise HTTPException(status_code=500, detail="LPIS client missing both infos() and getResults()")
-                # same normalization as before
-                data = (res or {}).get("data") or res or {}
-                pp_map = data.get("pp") or {}
-                q_lower = (p.q or "").strip().lower()
-                direct: List[Dict[str, Any]] = []
-                for pp_id, pp_obj in pp_map.items():
-                    lvs = (pp_obj or {}).get("lvs") or {}
-                    for lv_id, lv in lvs.items():
-                        title = (lv or {}).get("name") or ""
-                        prof = (lv or {}).get("prof") or ""
-                        hay = f"{title} {prof}".lower()
-                        if q_lower and q_lower not in hay:
-                            continue
-                        direct.append({
-                            "pp": str(pp_id),
-                            "lv": str(lv_id),
-                            "title": title,
-                            "lecturers": [p.strip() for p in prof.split("·")] if prof else [],
-                            "semester": lv.get("semester"),
-                            "status": lv.get("status"),
-                            "capacity": lv.get("capacity"),
-                            "free": lv.get("free"),
-                            "waitlist": lv.get("waitlist"),
-                        })
-                        if cap and len(direct) >= cap:
-                            break
-                    if cap and len(direct) >= cap:
-                        break
-                if direct:
-                    return {
-                        "ok": True,
-                        "items": direct,
-                        "meta": {
-                            "cached": bool(items_snapshot),
-                            "updated_at_unix": updated,
-                            "building": building,
-                            "fresh": (_now() - updated) < INDEX_TTL_SECONDS if updated else False,
-                            "provisional": True,   # indicates fallback was used
-                            "last_error": prov_error or last_error,
-                        }
-                    }
-            except Exception:
-                # swallow fallback errors; fall through to return whatever we have (possibly empty)
-                pass
 
         return {
             "ok": True,
@@ -851,7 +799,7 @@ def index_status(username: str):
             "build_finished": entry.get("build_finished"),
         }
 
-# -------- DEBUG --------
+# ---------- DEBUG ----------
 @app.post("/debug/structure")
 def debug_structure(p: SearchIn):
     try:
@@ -911,7 +859,7 @@ def debug_forms(p: SearchIn):
             forms_info.append({"name": None, "controls": []})
     return {"ok": True, "forms": forms_info}
 
-# -------- ENROLL --------
+# ---------- ENROLL ----------
 @app.post("/enroll")
 def enroll(p: EnrollIn):
     """
