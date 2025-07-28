@@ -3,24 +3,22 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
-from bs4 import BeautifulSoup
+import unicodedata, traceback, re, time, threading
+from bs4 import BeautifulSoup  # already in your env
 import unicodedata
 import traceback
-import threading
-import socket
 import re
 import time
+import threading
 
-# Hard timeouts so requests can't hang forever
-socket.setdefaulttimeout(8)
+from bs4 import BeautifulSoup  # already in your worker env
 
 app = FastAPI()
 
 # ---------------- Config ----------------
-INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
-REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 2000      # ~2s best-effort provisional scan
-TARGETED_SCAN_BUDGET_S = 6         # final fallback: up to 6s to guarantee some results
+INDEX_TTL_SECONDS = 600  # 10 minutes cache TTL; tune as needed
+INDEX_TTL_SECONDS = 600   # 10 minutes cache TTL; tune as needed
+REBUILD_TIME_BUDGET = 25  # seconds; stop early if taking too long
 
 # --------------- Models -----------------
 class SearchIn(BaseModel):
@@ -32,17 +30,12 @@ class SearchIn(BaseModel):
 class ReindexIn(BaseModel):
     username: str
     password: str
+    # optional: restrict to given PP ids to speed up a partial refresh
     pp_ids: Optional[List[str]] = None
-
-class EnrollIn(BaseModel):
-    username: str
-    password: str
-    pp: str
-    lv: str
-    group_id: Optional[str] = None
-    auto_waitlist: bool = True
+    pp_ids: Optional[List[str]] = None  # reserved; not used in current builder
 
 # --------------- Cache ------------------
+# CACHE: { username: { "items": List[dict], "updated": float_ts, "building": bool } }
 # CACHE: {
 #   username: {
 #       "items": List[dict],
@@ -60,6 +53,7 @@ def _now() -> float:
     return time.time()
 
 def _is_fresh(entry: Dict[str, Any]) -> bool:
+    return entry and ( _now() - entry.get("updated", 0) ) < INDEX_TTL_SECONDS
     return entry and ((_now() - entry.get("updated", 0.0)) < INDEX_TTL_SECONDS)
 
 # -------------- Text utils --------------
@@ -80,12 +74,12 @@ def _matches(tokens: List[str], title: str, prof: str, lv_id: str) -> bool:
         return True
     hay = " ".join(filter(None, [title, prof, str(lv_id)]))
     hay_n = _norm(hay)
-    return all(t in hay_n for t in tokens)  # strict AND
+    return all(t in hay_n for t in tokens)
 
 # -------------- LPIS client -------------
 def get_lpis_client(user: str, pw: str):
     try:
-        from lpislib import WuLpisApi  # vendored client
+        from lpislib import WuLpisApi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
     try:
@@ -94,17 +88,17 @@ def get_lpis_client(user: str, pw: str):
         raise HTTPException(status_code=502, detail=str(e))
 
 # --------- Low-level scraping (fast) ----
-def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
-                        cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
+def _parse_lv_table(pp_id: str, soup_lv: BeautifulSoup) -> List[Dict[str, Any]]:
+    rows_out: List[Dict[str, Any]] = []
+def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str], cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
     """
-    Parse a PP's LV table quickly and append matching rows to 'out'.
-    Robust title extraction + row-text fallback. Uses OR-match for tokens
-    (improves short queries like 'ja' while cache is building).
-    Returns True if cap reached so caller can stop early.
+    Parse a PP's LV table quickly and append only matching rows to 'out'.
+    Returns True if cap reached and caller can stop.
     """
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
     if not lv_body:
+        return rows_out
         return False
 
     for row in lv_body.find_all("tr"):
@@ -123,38 +117,29 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
         prof_div = row.select_one(".ver_title div")
         prof = (prof_div.get_text(" ", strip=True) if prof_div else "").strip()
 
-        # -------- ROBUST TITLE + FALLBACKS --------
+        # title (robust)
         name_td = row.find("td", {"class": "ver_title"})
         title = ""
-        cell_full = ""
         if name_td:
-            cell_full = (name_td.get_text(" ", strip=True) or "").strip()
-            # Prefer bare text nodes (often the actual title)
-            bare_texts = [t.strip() for t in name_td.find_all(string=True, recursive=False) if (t or "").strip()]
-            if bare_texts:
-                title = bare_texts[-1]
-            # Else try prominent child
-            if not title:
-                el = name_td.select_one("a, strong, span")
-                if el:
-                    title = (el.get_text(" ", strip=True) or "").strip()
-            # If title equals prof, drop it
-            if title and prof and _norm(title) == _norm(prof):
-                title = ""
-            # Last resort: strip trailing prof from full cell
-            if (not title) and cell_full:
-                if prof and cell_full.lower().endswith(prof.lower()):
-                    title = re.sub(re.escape(prof) + r"\s*$", "", cell_full).strip(" -·•\u00A0")
-                else:
-                    title = cell_full
-            title = re.sub(r"\s+", " ", title or "").strip()
-        # If no ver_title cell, at least use whole row text as a haystack
-        row_text = (row.get_text(" ", strip=True) or "").strip()
+            # Prefer an inner title element if present
+            title_el = name_td.select_one("a, strong, span")
+            title = (title_el.get_text(" ", strip=True) if title_el else name_td.get_text(" ", strip=True)).strip()
+            if prof:
+                title = re.sub(re.escape(prof) + r"\s*$", "", title).strip(" -·•\u00A0")
+            title = re.sub(r"\s+", " ", title).strip()
 
-        # status/capacity/wl
+        # fast matching (AND over tokens on title+prof+lv_id)
+        if tokens:
+            hay = " ".join(filter(None, [title, prof, lv_id]))
+            hay_n = _norm(hay)
+            if not all(t in hay_n for t in tokens):
+                continue
+
+        # status
         status_div = row.select_one("td.box div")
         status = (status_div.get_text(" ", strip=True) if status_div else None)
 
+        # capacity/free
         cap_div = row.select_one('div[class*="capacity_entry"]')
         free_val, cap_val = (None, None)
         if cap_div:
@@ -168,19 +153,14 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             except Exception:
                 pass
 
+        # waitlist
         waitlist = None
         wl_div = row.select_one('td.capacity div[title*="Anzahl Warteliste"]')
         if wl_div:
             span = wl_div.find("span")
             waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
 
-        # ---- matching (OR across tokens; include row_text as fallback haystack) ----
-        if tokens:
-            hay = " ".join(filter(None, [title, prof, lv_id, cell_full, row_text]))
-            hay_n = _norm(hay)
-            if not any(t in hay_n for t in tokens):  # OR instead of AND for speed/provisional
-                continue
-
+        rows_out.append({
         out.append({
             "pp": str(pp_id),
             "lv": str(lv_id),
@@ -192,12 +172,12 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             "free": free_val,
             "waitlist": waitlist,
         })
+    return rows_out
 
         if cap and len(out) >= cap:
-            return True
+            return True  # stop early
     return False
 
-# ---------- Builders / Scans ----------
 def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
     """Full index build for a user account; returns flat list of all LVs."""
     start = _now()
@@ -234,6 +214,7 @@ def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
     r = client.browser.submit()
     soup = BeautifulSoup(r.read(), "html.parser")
 
+    # Iterate PP rows and gather LV rows; stop on time budget
     items: List[Dict[str, Any]] = []
     table = soup.find("table", {"class": "b3k-data"})
     tbody = table.find("tbody") if table else None
@@ -241,7 +222,7 @@ def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
 
     for planpunkt in rows:
         if (_now() - start) > REBUILD_TIME_BUDGET:
-            break
+            break  # respect rebuild time budget
 
         a_tag = planpunkt.find("a")
         if not (a_tag and a_tag.get("id")):
@@ -257,6 +238,8 @@ def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
 
         res2 = client.browser.open(client.URL_scraped + lv_url_rel)
         soup_lv = BeautifulSoup(res2.read(), "html.parser")
+        items.extend(_parse_lv_table(pp_id, soup_lv))
+        # parse all rows for this PP (no query filter in the builder)
         _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=items)
 
     return items
@@ -266,12 +249,14 @@ def _ensure_index(username: str, password: str, force: bool = False):
     with _CACHE_LOCK:
         entry = _CACHE.get(username)
         if not force and entry and _is_fresh(entry):
-            return
+            return  # already fresh
 
+        # If a rebuild is already running, don't start another
         if entry and entry.get("building"):
             return
 
         if not entry:
+            entry = {"items": [], "updated": 0.0, "building": False}
             entry = {"items": [], "updated": 0.0, "building": False,
                      "last_error": None, "build_started": None, "build_finished": None}
             _CACHE[username] = entry
@@ -282,9 +267,13 @@ def _ensure_index(username: str, password: str, force: bool = False):
             entry["build_started"] = _now()
             entry["build_finished"] = None
             try:
+                entry["building"] = True
                 items = _build_index(username, password)
                 entry["items"] = items
                 entry["updated"] = _now()
+            except Exception:
+                # keep old snapshot on failure
+                pass
             except Exception as e:
                 entry["last_error"] = str(e)[:500]
             finally:
@@ -293,21 +282,21 @@ def _ensure_index(username: str, password: str, force: bool = False):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-def _provisional_scan(username: str, password: str, q: str, limit: Optional[int],
-                      timeout_ms: int = PROVISIONAL_TIMEOUT_MS) -> List[Dict[str, Any]]:
+def _provisional_scan(username: str, password: str, q: str, limit: Optional[int], timeout_ms: int = 900) -> List[Dict[str, Any]]:
     """
     Quick, best-effort scan for first-time requests so we don't return empty while cache builds.
-    Prioritizes likely PP candidates is omitted here to keep calls short; the targeted fallback
-    below will guarantee hits if needed.
+    Hard time-bounded; returns whatever it finds within timeout_ms.
     """
     start = _now()
     client = get_lpis_client(username, password)
 
+    # reach overview
     try:
         client.ensure_overview()
     except Exception:
         pass
 
+    # select form
     selected = False
     try:
         client.browser.select_form("ea_stupl")
@@ -343,7 +332,7 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
 
     for planpunkt in rows:
         if (_now() - start) * 1000 > timeout_ms:
-            break
+            break  # time budget exhausted
 
         a_tag = planpunkt.find("a")
         if not (a_tag and a_tag.get("id")):
@@ -363,95 +352,9 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         except Exception:
             continue
 
+        # parse minimal LV rows and apply filter
         if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
             break
-
-    return out
-
-def _targeted_scan(username: str, password: str, q: str, limit: int,
-                   time_budget_s: int = TARGETED_SCAN_BUDGET_S) -> List[Dict[str, Any]]:
-    """
-    Final fallback: guarantees some results by walking PPs until 'limit' matches are found
-    or 'time_budget_s' elapses. Uses OR matching and robust title extraction.
-    """
-    start = _now()
-    client = get_lpis_client(username, password)
-
-    try:
-        client.ensure_overview()
-    except Exception:
-        pass
-
-    selected = False
-    try:
-        client.browser.select_form("ea_stupl")
-        selected = True
-    except Exception:
-        for frm in client.browser.forms():
-            try:
-                client.browser.form = frm
-                _ = client.browser.form.find_control("ASPP")
-                selected = True
-                break
-            except Exception:
-                continue
-    if not selected:
-        return []
-
-    try:
-        item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
-        item.selected = True
-    except Exception:
-        pass
-
-    r = client.browser.submit()
-    soup = BeautifulSoup(r.read(), "html.parser")
-
-    tokens = [_norm(t) for t in (q or "").split() if t]
-    cap = limit if (isinstance(limit, int) and limit and limit > 0) else 10
-    out: List[Dict[str, Any]] = []
-
-    table = soup.find("table", {"class": "b3k-data"})
-    tbody = table.find("tbody") if table else None
-    rows = tbody.find_all("tr") if tbody else []
-
-    # Go through all PPs in order; stop when we have enough or time is up
-    for planpunkt in rows:
-        if (_now() - start) > time_budget_s:
-            break
-
-        a_tag = planpunkt.find("a")
-        if not (a_tag and a_tag.get("id")):
-            continue
-        pp_id = a_tag["id"][1:]
-
-        link_lv = planpunkt.select_one('a[href*="DLVO"]')
-        if not link_lv:
-            continue
-        lv_url_rel = (link_lv.get("href", "") or "").strip()
-        if not lv_url_rel:
-            continue
-
-        try:
-            res2 = client.browser.open(client.URL_scraped + lv_url_rel)
-            soup_lv = BeautifulSoup(res2.read(), "html.parser")
-        except Exception:
-            continue
-
-        # Collect without filtering, OR-filter in Python so short tokens hit
-        tmp: List[Dict[str, Any]] = []
-        _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=tmp)
-
-        for it in tmp:
-            hay = _norm(" ".join(filter(None, [
-                it.get("title") or "",
-                " ".join(it.get("lecturers") or []),
-                str(it.get("lv") or "")
-            ])))
-            if not tokens or any(t in hay for t in tokens):
-                out.append(it)
-                if cap and len(out) >= cap:
-                    return out
 
     return out
 
@@ -465,31 +368,36 @@ def root():
 def healthz():
     return {"ok": True}
 
-# ------ SEARCH (cache → provisional → targeted fallback) ------
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
-    1) Try cached (strict AND)
-    2) Provisional (~2s) using OR match inside row parser
-    3) Targeted fallback (up to 6s) scanning PPs until 'limit' matches found
+    Ultra-fast: returns from cache (ms). If cache is stale/missing, triggers a background rebuild.
+    Ultra-fast on warm cache. If cache is cold or building, return a provisional
+    result gathered within ~900 ms so the UI never shows an empty list.
+    Query semantics:
+      - AND over tokens; matches title + lecturers + LV id.
+      - limit=0 or None => no cap.
     """
     try:
+        # Kick off a rebuild if needed, but do NOT block the response.
+        # Kick off (or continue) background build, but don't block.
         _ensure_index(p.username, p.password, force=False)
 
+        # Read current snapshot
+        # Snapshot current cache
         with _CACHE_LOCK:
-            entry = _CACHE.get(p.username) or {
-                "items": [], "updated": 0.0, "building": False,
-                "last_error": None, "build_started": None, "build_finished": None
-            }
+            entry = _CACHE.get(p.username) or {"items": [], "updated": 0.0, "building": False}
+            entry = _CACHE.get(p.username) or {"items": [], "updated": 0.0, "building": False,
+                                               "last_error": None, "build_started": None, "build_finished": None}
             items_snapshot = list(entry.get("items", []))
             updated = entry.get("updated", 0.0)
             building = bool(entry.get("building"))
             last_error = entry.get("last_error")
 
+        # Filter snapshot
         tokens = [_norm(t) for t in (p.q or "").split() if t]
         cap = int(p.limit) if (isinstance(p.limit, int) and p.limit and p.limit > 0) else None
 
-        # Pass 1: strict AND-match on cache
         out: List[Dict[str, Any]] = []
         for it in items_snapshot:
             if _matches(tokens, it.get("title") or "", " ".join(it.get("lecturers") or []), it.get("lv") or ""):
@@ -497,58 +405,30 @@ def courses_search(p: SearchIn):
                 if cap and len(out) >= cap:
                     break
 
+        # If snapshot is empty (or not fresh) and we have a query, do a quick provisional scan
         provisional_used = False
-        prov_error = None
-
-        # Pass 2: provisional if nothing found and user typed something
         if (not out) and tokens:
-            provisional_used = True
             try:
-                prov = _provisional_scan(p.username, p.password, p.q, p.limit, timeout_ms=PROVISIONAL_TIMEOUT_MS)
+                # Hard cap ~900ms; tune to 700–1200ms
+                prov = _provisional_scan(p.username, p.password, p.q, p.limit, timeout_ms=900)
                 if prov:
                     out = prov[: (cap or len(prov))]
-            except Exception as e:
-                prov_error = str(e)
-
-        # Pass 2b: relaxed OR on cache if still empty
-        if (not out) and tokens and items_snapshot:
-            relaxed: List[Dict[str, Any]] = []
-            for it in items_snapshot:
-                hay = " ".join(filter(None, [
-                    it.get("title") or "",
-                    " ".join(it.get("lecturers") or []),
-                    str(it.get("lv") or "")
-                ]))
-                hay_n = _norm(hay)
-                if any(t in hay_n for t in tokens):   # OR instead of AND
-                    relaxed.append(it)
-                    if cap and len(relaxed) >= cap:
-                        break
-            if relaxed:
-                out = relaxed
-
-        # Pass 3: targeted fallback (guarantee some results within a bounded time)
-        targeted_used = False
-        if (not out) and tokens:
-            targeted_used = True
-            try:
-                tgt = _targeted_scan(p.username, p.password, p.q, limit=(cap or 10),
-                                     time_budget_s=TARGETED_SCAN_BUDGET_S)
-                if tgt:
-                    out = tgt[: (cap or len(tgt))]
-            except Exception as e:
-                prov_error = prov_error or str(e)
+                    provisional_used = True
+            except Exception:
+                pass
 
         return {
             "ok": True,
             "items": out,
             "meta": {
+                "cached": True,
                 "cached": bool(items_snapshot),
                 "updated_at_unix": updated,
                 "building": building,
+                "fresh": ( _now() - updated ) < INDEX_TTL_SECONDS
                 "fresh": (_now() - updated) < INDEX_TTL_SECONDS if updated else False,
-                "provisional": provisional_used or targeted_used,
-                "last_error": prov_error or last_error,
+                "provisional": provisional_used,
+                "last_error": last_error,
             }
         }
 
@@ -560,6 +440,10 @@ def courses_search(p: SearchIn):
 
 @app.post("/courses/reindex")
 def courses_reindex(p: ReindexIn):
+    """
+    Force a background reindex for this account. Returns immediately.
+    Frontend can call this right after storing credentials, and a cron can call it every N minutes.
+    """
     try:
         _ensure_index(p.username, p.password, force=True)
         return {"ok": True, "queued": True}
@@ -586,9 +470,12 @@ def index_status(username: str):
             "build_finished": entry.get("build_finished"),
         }
 
-# -------- DEBUG --------
 @app.post("/debug/structure")
 def debug_structure(p: SearchIn):
+    """
+    TEMP endpoint to introspect what the scraper sees after login.
+    Do not expose publicly in production.
+    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
@@ -600,6 +487,7 @@ def debug_structure(p: SearchIn):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LPIS navigation failed: {e}")
 
+    # Normalize potential structures
     normalized = data
     if hasattr(client, "getResults") and "data" not in normalized:
         try:
@@ -621,12 +509,17 @@ def debug_structure(p: SearchIn):
 
 @app.post("/debug/forms")
 def debug_forms(p: SearchIn):
+    """
+    Lists form names and their controls from the current mechanize context after ensure_overview().
+    Helpful when LPIS instances differ in form naming.
+    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
 
     client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
+    # open post-login base and try to reach overview
     try:
         client.ensure_overview()
     except Exception as e:
@@ -645,222 +538,3 @@ def debug_forms(p: SearchIn):
         except Exception:
             forms_info.append({"name": None, "controls": []})
     return {"ok": True, "forms": forms_info}
-
-# -------- ENROLL --------
-@app.post("/enroll")
-def enroll(p: EnrollIn):
-    if not p.username or not p.password or not p.pp or not p.lv:
-        raise HTTPException(status_code=400, detail="Missing credentials or pp/lv.")
-    try:
-        client = get_lpis_client(p.username, p.password)
-        try:
-            client.ensure_overview()
-        except Exception:
-            pass
-
-        soup_lv = _reach_pp_lv_page(client, str(p.pp))
-        res = _submit_enroll_on_lv_page(client, soup_lv, str(p.lv), p.group_id, p.auto_waitlist)
-        return {
-            "ok": True,
-            "result": res.get("result"),
-            "message": res.get("message"),
-            "payload": { "pp": str(p.pp), "lv": str(p.lv) }
-        }
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-# ---- Helpers used by enroll ----
-def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
-    selected = False
-    try:
-        client.browser.select_form("ea_stupl")
-        selected = True
-    except Exception:
-        for frm in client.browser.forms():
-            try:
-                client.browser.form = frm
-                _ = client.browser.form.find_control("ASPP")
-                selected = True
-                break
-            except Exception:
-                continue
-    if not selected:
-        raise HTTPException(status_code=502, detail="Could not reach study-plan form (ea_stupl/ASPP).")
-
-    try:
-        item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
-        item.selected = True
-    except Exception:
-        pass
-
-    r = client.browser.submit()
-    soup = BeautifulSoup(r.read(), "html.parser")
-
-    table = soup.find("table", {"class": "b3k-data"})
-    tbody = table.find("tbody") if table else None
-    rows = tbody.find_all("tr") if tbody else []
-
-    dlvo_href = None
-    for planpunkt in rows:
-        a_tag = planpunkt.find("a")
-        if not (a_tag and a_tag.get("id")):
-            continue
-        cur_pp = a_tag["id"][1:]
-        if cur_pp != str(pp_id):
-            continue
-        link_lv = planpunkt.select_one('a[href*="DLVO"]')
-        if link_lv:
-            dlvo_href = (link_lv.get("href") or "").strip()
-            break
-
-    if not dlvo_href:
-        try:
-            data = client.infos()
-            pp_map = (data or {}).get("pp") or {}
-            entry = pp_map.get(str(pp_id)) or pp_map.get(pp_id)
-            if entry and entry.get("lv_url"):
-                dlvo_href = entry["lv_url"]
-        except Exception:
-            pass
-
-    if not dlvo_href:
-        raise HTTPException(status_code=404, detail=f"PP {pp_id} not found or no LV link.")
-
-    res2 = client.browser.open(client.URL_scraped + dlvo_href)
-    return BeautifulSoup(res2.read(), "html.parser")
-
-def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
-                              group_id: Optional[str], auto_waitlist: bool) -> Dict[str, Any]:
-    lv_table = soup_lv.find("table", {"class": "b3k-data"})
-    lv_body = lv_table.find("tbody") if lv_table else None
-    if not lv_body:
-        raise HTTPException(status_code=502, detail="LV table not present on DLVO page.")
-
-    target_form_name = None
-    pre_status_txt = ""
-    for row in lv_body.find_all("tr"):
-        ver_id_link = row.select_one(".ver_id a")
-        if not ver_id_link:
-            continue
-        cur_lv = (ver_id_link.get_text(" ", strip=True) or "").strip()
-        if cur_lv != str(lv_id):
-            continue
-
-        status_div = row.select_one("td.box div")
-        pre_status_txt = (status_div.get_text(" ", strip=True) if status_div else "").strip().lower()
-
-        form = row.select_one("td.action form")
-        if form and form.get("name"):
-            target_form_name = form["name"]
-        break
-
-    if not target_form_name:
-        raise HTTPException(status_code=404, detail=f"LV {lv_id} not found or no enroll form present.")
-
-    if any(k in pre_status_txt for k in ["nicht möglich", "gesperrt", "geschlossen"]):
-        return {"result": "closed", "message": "Anmeldung derzeit nicht möglich (laut LV-Status)."}
-
-    try:
-        client.browser.select_form(target_form_name)
-    except Exception:
-        matched = False
-        for frm in client.browser.forms():
-            if getattr(frm, "name", None) == target_form_name:
-                client.browser.form = frm
-                matched = True
-                break
-        if not matched:
-            raise HTTPException(status_code=502, detail="Enroll form not selectable in mechanize context.")
-
-    if group_id:
-        for possible in ["GRUPPE", "group", "GROUP", "grp", "gruppe", "GRP_ID", "GRUPPE_ID"]:
-            try:
-                ctrl = client.browser.form.find_control(possible)
-                try:
-                    ctrl.value = [group_id]
-                except Exception:
-                    try:
-                        ctrl.value = group_id
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-
-    if auto_waitlist:
-        for ctrl in getattr(client.browser.form, "controls", []):
-            try:
-                if hasattr(ctrl, "items") and ctrl.items:
-                    for item in ctrl.items:
-                        try:
-                            labels = []
-                            try:
-                                labels = [l.text.lower() for l in item.get_labels()]
-                            except Exception:
-                                pass
-                            if any("wart" in (lbl or "") for lbl in labels):
-                                item.selected = True
-                        except Exception:
-                            continue
-                val = getattr(ctrl, "value", None)
-                if isinstance(val, str) and "wart" in val.lower():
-                    ctrl.value = val
-            except Exception:
-                continue
-
-    r3 = client.browser.submit()
-    soup3 = BeautifulSoup(r3.read(), "html.parser")
-    page_text = soup3.get_text(" ", strip=True).lower()
-
-    confirm_needed = any(k in page_text for k in ["bestätigen", "bestaetigen", "überprüfen", "ueberpruefen"]) and not any(
-        k in page_text for k in ["erfolgreich", "warteliste", "bereits angemeldet"]
-    )
-
-    if confirm_needed:
-        picked = False
-        try:
-            for frm in client.browser.forms():
-                nm = (getattr(frm, "name", "") or "").lower()
-                if any(x in nm for x in ["bestaet", "bestät", "confirm"]):
-                    client.browser.form = frm
-                    picked = True
-                    break
-        except Exception:
-            pass
-
-        if not picked:
-            try:
-                client.browser.form = next(iter(client.browser.forms()))
-                picked = True
-            except Exception:
-                picked = False
-
-        if picked:
-            try:
-                r4 = client.browser.submit()
-                soup4 = BeautifulSoup(r4.read(), "html.parser")
-                page_text = soup4.get_text(" ", strip=True).lower()
-            except Exception:
-                pass
-
-    if any(k in page_text for k in ["erfolgreich angemeldet", "anmeldung erfolgreich", "erfolgreich durchgef"]):
-        return {"result": "success", "message": "Anmeldung erfolgreich."}
-    if "warteliste" in page_text or "auf die warteliste" in page_text:
-        return {"result": "waitlist", "message": "Auf Warteliste eingetragen."}
-    if any(k in page_text for k in ["bereits angemeldet", "schon angemeldet"]):
-        return {"result": "already", "message": "Bereits angemeldet."}
-    if any(k in page_text for k in ["nicht möglich", "gesperrt", "geschlossen"]):
-        return {"result": "closed", "message": "Anmeldung derzeit nicht möglich."}
-
-    snippet = page_text[:600]
-    forms = []
-    try:
-        forms = [getattr(f, "name", None) for f in client.browser.forms()]
-    except Exception:
-        pass
-    return {
-        "result": "unknown",
-        "message": "Status unklar – bitte im LPIS prüfen.",
-        "debug": {"snippet": snippet, "forms": forms}
-    }
