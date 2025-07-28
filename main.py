@@ -298,7 +298,8 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
                       timeout_ms: int = PROVISIONAL_TIMEOUT_MS) -> List[Dict[str, Any]]:
     """
     Quick, best-effort scan for first-time requests so we don't return empty while cache builds.
-    Time-bounded; returns whatever it finds within timeout_ms.
+    PRIORITIZES plan points (PP) whose displayed name matches any query token, so we hit likely
+    matches first within the time budget.
     """
     start = _now()
     client = get_lpis_client(username, password)
@@ -308,6 +309,7 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
     except Exception:
         pass
 
+    # Reach study-plan form
     selected = False
     try:
         client.browser.select_form("ea_stupl")
@@ -324,6 +326,7 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
     if not selected:
         return []
 
+    # Pick first ASPP option
     try:
         item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
         item.selected = True
@@ -333,22 +336,22 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
     r = client.browser.submit()
     soup = BeautifulSoup(r.read(), "html.parser")
 
+    # Tokenize query
     tokens = [_norm(t) for t in (q or "").split() if t]
     cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
     out: List[Dict[str, Any]] = []
 
+    # Collect all planpunkt rows and compute a priority score
     table = soup.find("table", {"class": "b3k-data"})
     tbody = table.find("tbody") if table else None
     rows = tbody.find_all("tr") if tbody else []
 
+    candidates = []  # list of (priority, pp_id, lv_url_rel)
     for planpunkt in rows:
-        if (_now() - start) * 1000 > timeout_ms:
-            break
-
         a_tag = planpunkt.find("a")
         if not (a_tag and a_tag.get("id")):
             continue
-        pp_id = a_tag["id"][1:]
+        pp_id = a_tag["id"][1:]  # 'S12345' -> '12345'
 
         link_lv = planpunkt.select_one('a[href*="DLVO"]')
         if not link_lv:
@@ -357,14 +360,73 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         if not lv_url_rel:
             continue
 
+        # Try to read the PP display name (type + name spans)
+        span1 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(1)")
+        span2 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(2)")
+        pp_type = (span1.get_text(" ", strip=True) if span1 else "").strip()
+        pp_name = (span2.get_text(" ", strip=True) if span2 else "").strip()
+        if not pp_name:
+            # fallback: second TD full text
+            second_td = planpunkt.select_one("td:nth-of-type(2)")
+            pp_name = (second_td.get_text(" ", strip=True) if second_td else "").strip()
+
+        # Compute priority: 0 = high if any token matches PP name/type, else 1
+        hay = _norm(" ".join([pp_type, pp_name]))
+        priority = 1
+        if tokens and any(t in hay for t in tokens):
+            priority = 0
+
+        candidates.append((priority, pp_id, lv_url_rel))
+
+    # Sort so we open the most promising PP first
+    candidates.sort(key=lambda x: x[0])
+
+    # Now iterate candidates within time budget
+    for priority, pp_id, lv_url_rel in candidates:
+        if (_now() - start) * 1000 > timeout_ms:
+            break
         try:
             res2 = client.browser.open(client.URL_scraped + lv_url_rel)
             soup_lv = BeautifulSoup(res2.read(), "html.parser")
         except Exception:
             continue
 
+        # Parse rows and apply strict AND-match on tokens
         if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
             break
+
+    # If we still have nothing and we have time left, do one relaxed pass (OR-match) on the top PPs
+    if not out and tokens and ((_now() - start) * 1000) <= timeout_ms:
+        # Re-scan top few candidates quickly with OR filter by letting tokens=[] in fast parse,
+        # then OR-filter here in Python.
+        budget_left_ms = max(0, timeout_ms - int((_now() - start) * 1000))
+        top = candidates[: min(5, len(candidates))]  # small subset
+        for priority, pp_id, lv_url_rel in top:
+            if (_now() - start) * 1000 > timeout_ms:
+                break
+            try:
+                res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+                soup_lv = BeautifulSoup(res2.read(), "html.parser")
+            except Exception:
+                continue
+
+            tmp: List[Dict[str, Any]] = []
+            # collect without filtering, then OR-filter locally
+            _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=tmp)
+
+            # OR-filter
+            for it in tmp:
+                hay = _norm(" ".join(filter(None, [
+                    it.get("title") or "",
+                    " ".join(it.get("lecturers") or []),
+                    str(it.get("lv") or "")
+                ])))
+                if any(t in hay for t in tokens):
+                    out.append(it)
+                    if cap and len(out) >= cap:
+                        break
+            if cap and len(out) >= cap:
+                break
 
     return out
 
