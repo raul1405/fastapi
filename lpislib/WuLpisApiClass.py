@@ -5,11 +5,16 @@ import os
 import re
 import pickle
 import datetime
+import socket
 from typing import Any, Dict
 
 import mechanize
 from bs4 import BeautifulSoup
 from lxml import html
+
+# Hard-cap each HTTP call so mechanize can't hang forever.
+# Tune between 3–8 seconds depending on LPIS responsiveness.
+socket.setdefaulttimeout(6)
 
 
 class WuLpisApi:
