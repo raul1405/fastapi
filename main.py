@@ -21,7 +21,7 @@ app = FastAPI()
 # ---------- Config ----------
 INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
 REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 2000      # ~2s overall budget for provisional scan
+PROVISIONAL_TIMEOUT_MS = 900      # ~2s overall budget for provisional scan
 PROVISIONAL_NET_TIMEOUT = 1.8      # per-request timeout used INSIDE provisional scan
 
 # ---------- Models ----------
