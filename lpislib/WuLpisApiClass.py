@@ -1,27 +1,3 @@
-```python
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-lpislib/WuLpisApiClass.py
-
-A minimal, Python 3–safe LPIS scraper used by your FastAPI worker.
-It logs in to LPIS, navigates to the study-plan overview, and extracts
-plan points (pp) with their contained LVs (lv).
-
-Dependencies expected in your environment:
-  - mechanize
-  - beautifulsoup4
-  - lxml
-  - python-dateutil  (only if you add date parsing later)
-
-Usage (from your FastAPI app):
-    from lpislib import WuLpisApi
-    client = WuLpisApi(username, password, args=None, sessiondir=None)
-    data = client.infos()           # returns {"pp": {...}, "studies_count": N}
-    result = client.getResults()    # returns {"data": <data>, "status": {...}}
-"""
-
 import os
 import re
 import pickle
