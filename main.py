@@ -19,7 +19,7 @@ app = FastAPI()
 # ---------------- Config ----------------
 INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
 REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 900       # ~1s best-effort provisional scan
+PROVISIONAL_TIMEOUT_MS = 2000       # ~1s best-effort provisional scan
 
 # --------------- Models -----------------
 class SearchIn(BaseModel):
@@ -571,8 +571,8 @@ def healthz():
 def courses_search(p: SearchIn):
     """
     Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
-    - run a ~1s provisional scan and always report it in meta,
-    - then try a relaxed OR-match as a fallback for very short queries.
+    - run ~1–1.5s provisional scan,
+    - if still empty, run a broad provisional scan, then OR-filter in Python.
     """
     try:
         _ensure_index(p.username, p.password, force=False)
@@ -627,6 +627,29 @@ def courses_search(p: SearchIn):
             if relaxed:
                 out = relaxed
 
+        # Pass 3: broad provisional scan then OR-filter (final fallback while cache builds)
+        if (not out) and tokens:
+            try:
+                broad = _provisional_scan(p.username, p.password, "", max(p.limit or 20, 40),
+                                          timeout_ms=PROVISIONAL_TIMEOUT_MS)
+                if broad:
+                    filtered = []
+                    for it in broad:
+                        hay = " ".join(filter(None, [
+                            it.get("title") or "",
+                            " ".join(it.get("lecturers") or []),
+                            str(it.get("lv") or "")
+                        ]))
+                        hay_n = _norm(hay)
+                        if any(t in hay_n for t in tokens):  # OR-match
+                            filtered.append(it)
+                            if cap and len(filtered) >= cap:
+                                break
+                    if filtered:
+                        out = filtered
+            except Exception as e:
+                prov_error = prov_error or str(e)
+
         return {
             "ok": True,
             "items": out,
@@ -635,7 +658,7 @@ def courses_search(p: SearchIn):
                 "updated_at_unix": updated,
                 "building": building,
                 "fresh": (_now() - updated) < INDEX_TTL_SECONDS if updated else False,
-                "provisional": provisional_used,     # true even if provisional found nothing
+                "provisional": True if ((not items_snapshot) or provisional_used) else False,
                 "last_error": prov_error or last_error,
             }
         }
