@@ -1,7 +1,8 @@
-# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
+
+from lpislib import WuLpisApi  # <- vendored client
 
 app = FastAPI()
 
@@ -13,24 +14,11 @@ def root():
 def healthz():
     return {"ok": True}
 
-# ---------- Input models
 class SearchIn(BaseModel):
     username: str
     password: str
     q: str
     limit: Optional[int] = 20
-
-# ---------- wu-lpis-api client loader (handles different export names)
-def make_lpis_client(user: str, pw: str):
-    try:
-        from wu_lpis_api.WuLpisApiClass import WuLpisApi  # common path
-        return WuLpisApi(user, pw, args=None, sessiondir=None)
-    except Exception:
-        try:
-            from wu_lpis_api import WuLpisApi  # fallback export
-            return WuLpisApi(user, pw, args=None, sessiondir=None)
-        except Exception as e:
-            raise RuntimeError(f"wu-lpis-api not importable: {e}")
 
 def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
@@ -46,7 +34,6 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
             hay   = f"{title} {prof}".lower()
             if q_lower and q_lower not in hay:
                 continue
-
             items.append({
                 "pp": str(pp_id),
                 "lv": str(lv_id),
@@ -64,14 +51,11 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
 
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
-    """
-    Logs in to LPIS via wu-lpis-api, calls infos(), and returns real items.
-    """
     try:
         if not p.username or not p.password:
             raise HTTPException(status_code=400, detail="Missing credentials")
 
-        client = make_lpis_client(p.username, p.password)
+        client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
         res = client.infos()
         if hasattr(client, "getResults"):
             res = client.getResults()
@@ -81,5 +65,4 @@ def courses_search(p: SearchIn):
     except HTTPException:
         raise
     except Exception as e:
-        # Forward as 502 so the frontend knows it failed upstream
         raise HTTPException(status_code=502, detail=str(e))
