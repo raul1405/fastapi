@@ -13,16 +13,16 @@ import re
 import time
 
 # ---------- Global network defaults ----------
-# Hard timeouts so requests can't hang forever
-socket.setdefaulttimeout(8)  # default for normal paths
+# Hard default so requests can't hang forever (used outside provisional path)
+socket.setdefaulttimeout(8)
 
 app = FastAPI()
 
 # ---------- Config ----------
 INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
 REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 900      # ~2s overall budget for provisional scan
-PROVISIONAL_NET_TIMEOUT = 1.8      # per-request timeout used INSIDE provisional scan
+PROVISIONAL_TIMEOUT_MS = 4500      # ~4.5s overall budget for provisional scan
+PROVISIONAL_NET_TIMEOUT = 3.0      # per-request timeout for LV page fetches inside provisional
 
 # ---------- Models ----------
 class SearchIn(BaseModel):
@@ -306,21 +306,20 @@ def _ensure_index(username: str, password: str, force: bool = False):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-# ---------- Provisional scan (true fast path) ----------
-# replace the whole _provisional_scan with this version
+# ---------- Provisional scan (staged fast path) ----------
 def _provisional_scan(username: str, password: str, q: str, limit: Optional[int],
                       timeout_ms: int = PROVISIONAL_TIMEOUT_MS) -> List[Dict[str, Any]]:
     """
     Staged fast path:
-      - LOGIN & first submit with a slightly higher timeout (~4s) to survive TLS/redirects
-      - LV page fetches with short timeout (~1.8s) to keep total under a few seconds
+      - Login & first submit with slightly higher timeout (~5s) to survive TLS/redirects
+      - LV page fetches with short timeout (~3.0s) to keep total within a few seconds
     """
-    LOGIN_TIMEOUT = 4.0
-    PAGE_TIMEOUT  = PROVISIONAL_NET_TIMEOUT  # 1.8s from config
+    LOGIN_TIMEOUT = 5.0
+    PAGE_TIMEOUT  = PROVISIONAL_NET_TIMEOUT  # 3.0
     start = _now()
     out: List[Dict[str, Any]] = []
 
-    # 1) Login + reach PP table (allow up to ~4s per call)
+    # 1) Login + reach PP table
     with _temp_socket_timeout(LOGIN_TIMEOUT):
         client = get_lpis_client(username, password)
         try:
@@ -328,7 +327,6 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         except Exception:
             pass
 
-        # Select study-plan form
         selected = False
         try:
             client.browser.select_form("ea_stupl")
@@ -345,21 +343,19 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         if not selected:
             return []
 
-        # Preselect first ASPP option
         try:
             item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
             item.selected = True
         except Exception:
             pass
 
-        # Submit to show planpunkte table
         try:
             r = client.browser.submit()
         except Exception:
             return []
         soup = BeautifulSoup(r.read(), "html.parser")
 
-    # 2) Decide which PPs to open (cheap, no network)
+    # 2) Choose candidate PPs
     tokens = [_norm(t) for t in (q or "").split() if t]
     cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
 
@@ -384,7 +380,6 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         if not lv_url_rel:
             continue
 
-        # Use PP type+name to prioritize likely matches
         span1 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(1)")
         span2 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(2)")
         pp_type = (span1.get_text(" ", strip=True) if span1 else "").strip()
@@ -394,19 +389,16 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
             pp_name = (second_td.get_text(" ", strip=True) if second_td else "").strip()
 
         hay = _norm(" ".join([pp_type, pp_name]))
-        priority = 1
-        if tokens and any(t in hay for t in tokens):
-            priority = 0
+        priority = 0 if (tokens and any(t in hay for t in tokens)) else 1
 
         candidates.append((priority, pp_id, lv_url_rel))
 
     candidates.sort(key=lambda x: x[0])
-    # open only a few PPs; allow a bit more when tokens exist
-    candidates = candidates[:5] if tokens else candidates[:3]
+    candidates = candidates[:6] if tokens else candidates[:3]
 
-    # 3) Open LV pages fast (short timeout) and parse
+    # 3) Open LV pages quickly and parse
     with _temp_socket_timeout(PAGE_TIMEOUT):
-        for priority, pp_id, lv_url_rel in candidates:
+        for _prio, pp_id, lv_url_rel in candidates:
             if (_now() - start) * 1000 > timeout_ms:
                 break
             try:
@@ -418,13 +410,12 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
             except Exception:
                 continue
 
-            # Strict AND match first
             if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
                 break
 
-        # If still empty and time left, do a tiny relaxed OR pass on top candidates
+        # relaxed OR pass (tiny) if still empty and time left
         if not out and tokens and ((_now() - start) * 1000) <= timeout_ms:
-            for priority, pp_id, lv_url_rel in candidates[:2]:
+            for _prio, pp_id, lv_url_rel in candidates[:2]:
                 if (_now() - start) * 1000 > timeout_ms:
                     break
                 try:
@@ -677,7 +668,7 @@ def healthz():
 def courses_search(p: SearchIn):
     """
     Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
-    - run ~2s provisional scan (with per-call timeout),
+    - run provisional scan (staged timeouts),
     - then try a relaxed OR-match on cache,
     - finally a broad provisional scan and OR-filter (fallback).
     """
@@ -726,7 +717,6 @@ def courses_search(p: SearchIn):
                     " ".join(it.get("lecturers") or []),
                     str(it.get("lv") or "")
                 ]))
-            # normalize once
                 hay_n = _norm(hay)
                 if any(t in hay_n for t in tokens):   # OR instead of AND
                     relaxed.append(it)
@@ -865,6 +855,76 @@ def debug_forms(p: SearchIn):
         except Exception:
             forms_info.append({"name": None, "controls": []})
     return {"ok": True, "forms": forms_info}
+
+@app.post("/debug/provisional")
+def debug_provisional(p: SearchIn):
+    """Show which PP LV pages were opened during a provisional-like scan."""
+    LOGIN_TIMEOUT = 5.0
+    PAGE_TIMEOUT  = PROVISIONAL_NET_TIMEOUT
+    start = _now()
+    tried: List[Dict[str, Any]] = []
+
+    with _temp_socket_timeout(LOGIN_TIMEOUT):
+        client = get_lpis_client(p.username, p.password)
+        try:
+            client.ensure_overview()
+        except Exception:
+            pass
+        # reach form
+        try:
+            client.browser.select_form("ea_stupl")
+        except Exception:
+            for frm in client.browser.forms():
+                try:
+                    client.browser.form = frm
+                    _ = client.browser.form.find_control("ASPP")
+                    break
+                except Exception:
+                    continue
+        try:
+            item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
+            item.selected = True
+        except Exception:
+            pass
+        r = client.browser.submit()
+        soup = BeautifulSoup(r.read(), "html.parser")
+
+    table = soup.find("table", {"class": "b3k-data"})
+    tbody = table.find("tbody") if table else None
+    rows = tbody.find_all("tr") if tbody else []
+
+    candidates = []
+    for planpunkt in rows:
+        a_tag = planpunkt.find("a")
+        if not (a_tag and a_tag.get("id")):
+            continue
+        pp_id = a_tag["id"][1:]
+        link_lv = planpunkt.select_one('a[href*="DLVO"]')
+        if not link_lv:
+            continue
+        lv_url_rel = (link_lv.get("href", "") or "").strip()
+        candidates.append((pp_id, lv_url_rel))
+    candidates = candidates[:6]
+
+    with _temp_socket_timeout(PAGE_TIMEOUT):
+        for pp_id, lv_url_rel in candidates:
+            rec = {"pp": pp_id, "href": lv_url_rel, "ok": False, "rows": 0, "error": None}
+            try:
+                try:
+                    res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PAGE_TIMEOUT)
+                except TypeError:
+                    res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+                soup_lv = BeautifulSoup(res2.read(), "html.parser")
+                lv_table = soup_lv.find("table", {"class": "b3k-data"})
+                lv_body = lv_table.find("tbody") if lv_table else None
+                rows_lv = lv_body.find_all("tr") if lv_body else []
+                rec["rows"] = len(rows_lv)
+                rec["ok"] = True
+            except Exception as e:
+                rec["error"] = str(e)[:180]
+            tried.append(rec)
+
+    return {"ok": True, "tried": tried, "took_ms": int((_now() - start) * 1000)}
 
 # ---------- ENROLL ----------
 @app.post("/enroll")
