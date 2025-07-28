@@ -3,7 +3,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
+import unicodedata
 import traceback
+import re
 
 app = FastAPI()
 
@@ -28,9 +30,28 @@ class SearchIn(BaseModel):
 
 
 # ---------- Helpers ----------
+def _norm(s: str) -> str:
+    """Lowercase, strip accents, collapse whitespace."""
+    s = (s or "")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
+def _split_lecturers(prof: str) -> List[str]:
+    """Split lecturer string into a clean list (handles · , ; / |)."""
+    if not prof:
+        return []
+    parts = re.split(r"[·•|,;/]+", prof)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
 def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[Dict[str, Any]]:
     """
     Normalize LPIS structure to a flat course list used by the UI.
+    - Matches on course title, lecturer(s), and LV id.
+    - Multi-word query uses AND semantics.
+    - limit=0 or None means 'no cap'.
     """
     items: List[Dict[str, Any]] = []
 
@@ -40,31 +61,40 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
     data = (result or {}).get("data") or result or {}
     pp_map = data.get("pp") or {}
 
-    q_lower = (q or "").strip().lower()
+    tokens = [_norm(t) for t in (q or "").split() if t]
+
+    def matches(title: str, prof: str, lv_id: str) -> bool:
+        if not tokens:
+            return True
+        hay = " ".join(filter(None, [title, prof, str(lv_id)]))
+        hay_n = _norm(hay)
+        return all(t in hay_n for t in tokens)
+
+    cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else None
 
     for pp_id, pp_obj in pp_map.items():
         lvs = (pp_obj or {}).get("lvs") or {}
         for lv_id, lv in lvs.items():
             title = (lv or {}).get("name") or ""
             prof = (lv or {}).get("prof") or ""
-            hay = f"{title} {prof}".lower()
-
-            if q_lower and q_lower not in hay:
+            if not matches(title, prof, str(lv_id)):
                 continue
 
             items.append({
                 "pp": str(pp_id),
                 "lv": str(lv_id),
                 "title": title,
-                "lecturers": [p.strip() for p in prof.split("·")] if prof else [],
+                "lecturers": _split_lecturers(prof),
                 "semester": lv.get("semester"),
                 "status": lv.get("status"),
                 "capacity": lv.get("capacity"),
                 "free": lv.get("free"),
                 "waitlist": lv.get("waitlist"),
             })
-            if limit and len(items) >= limit:
+
+            if cap and len(items) >= cap:
                 return items
+
     return items
 
 
@@ -89,6 +119,9 @@ def get_lpis_client(user: str, pw: str):
 def courses_search(p: SearchIn):
     """
     Logs in to LPIS, scrapes the study plan, filters LVs by 'q', returns a flat list.
+    - Matches title + lecturer + lv id (accent-insensitive).
+    - Multi-word queries are ANDed.
+    - limit=0 (or null) means 'no cap'.
     """
     try:
         client = get_lpis_client(p.username, p.password)  # may raise HTTPException(500/502)
@@ -150,8 +183,13 @@ def debug_structure(p: SearchIn):
         "sample_pp_ids": list(pp.keys())[:5],
     }
 
+
 @app.post("/debug/forms")
 def debug_forms(p: SearchIn):
+    """
+    Lists form names and their controls from the current mechanize context after ensure_overview().
+    Helpful when LPIS instances differ in form naming.
+    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
@@ -162,8 +200,7 @@ def debug_forms(p: SearchIn):
     try:
         client.ensure_overview()
     except Exception as e:
-        # If ensure_overview not present because you didn't paste it right:
-        raise HTTPException(status_code=500, detail=f"ensure_overview missing: {e}")
+        raise HTTPException(status_code=500, detail=f"ensure_overview missing or failed: {e}")
 
     forms_info = []
     for frm in client.browser.forms():
