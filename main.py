@@ -3,13 +3,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
-import unicodedata, traceback, re, time, threading
-from bs4 import BeautifulSoup  # already in your env
+import unicodedata
+import traceback
+import re
+import time
+import threading
+
+from bs4 import BeautifulSoup  # already in your worker env
 
 app = FastAPI()
 
 # ---------------- Config ----------------
-INDEX_TTL_SECONDS = 600  # 10 minutes cache TTL; tune as needed
+INDEX_TTL_SECONDS = 600   # 10 minutes cache TTL; tune as needed
 REBUILD_TIME_BUDGET = 25  # seconds; stop early if taking too long
 
 # --------------- Models -----------------
@@ -22,11 +27,19 @@ class SearchIn(BaseModel):
 class ReindexIn(BaseModel):
     username: str
     password: str
-    # optional: restrict to given PP ids to speed up a partial refresh
-    pp_ids: Optional[List[str]] = None
+    pp_ids: Optional[List[str]] = None  # reserved; not used in current builder
 
 # --------------- Cache ------------------
-# CACHE: { username: { "items": List[dict], "updated": float_ts, "building": bool } }
+# CACHE: {
+#   username: {
+#       "items": List[dict],
+#       "updated": float,
+#       "building": bool,
+#       "last_error": str|None,
+#       "build_started": float|None,
+#       "build_finished": float|None
+#   }
+# }
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 
@@ -34,7 +47,7 @@ def _now() -> float:
     return time.time()
 
 def _is_fresh(entry: Dict[str, Any]) -> bool:
-    return entry and ( _now() - entry.get("updated", 0) ) < INDEX_TTL_SECONDS
+    return entry and ((_now() - entry.get("updated", 0.0)) < INDEX_TTL_SECONDS)
 
 # -------------- Text utils --------------
 def _norm(s: str) -> str:
@@ -68,12 +81,15 @@ def get_lpis_client(user: str, pw: str):
         raise HTTPException(status_code=502, detail=str(e))
 
 # --------- Low-level scraping (fast) ----
-def _parse_lv_table(pp_id: str, soup_lv: BeautifulSoup) -> List[Dict[str, Any]]:
-    rows_out: List[Dict[str, Any]] = []
+def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str], cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
+    """
+    Parse a PP's LV table quickly and append only matching rows to 'out'.
+    Returns True if cap reached and caller can stop.
+    """
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
     if not lv_body:
-        return rows_out
+        return False
 
     for row in lv_body.find_all("tr"):
         ver_id_link = row.select_one(".ver_id a")
@@ -83,24 +99,37 @@ def _parse_lv_table(pp_id: str, soup_lv: BeautifulSoup) -> List[Dict[str, Any]]:
         if not lv_id:
             continue
 
+        # semester
         sem_span = row.select_one(".ver_id span")
         semester = (sem_span.get_text(" ", strip=True) if sem_span else None)
 
+        # lecturer(s)
         prof_div = row.select_one(".ver_title div")
         prof = (prof_div.get_text(" ", strip=True) if prof_div else "").strip()
 
+        # title (robust)
         name_td = row.find("td", {"class": "ver_title"})
         title = ""
         if name_td:
+            # Prefer an inner title element if present
             title_el = name_td.select_one("a, strong, span")
             title = (title_el.get_text(" ", strip=True) if title_el else name_td.get_text(" ", strip=True)).strip()
             if prof:
                 title = re.sub(re.escape(prof) + r"\s*$", "", title).strip(" -·•\u00A0")
             title = re.sub(r"\s+", " ", title).strip()
 
+        # fast matching (AND over tokens on title+prof+lv_id)
+        if tokens:
+            hay = " ".join(filter(None, [title, prof, lv_id]))
+            hay_n = _norm(hay)
+            if not all(t in hay_n for t in tokens):
+                continue
+
+        # status
         status_div = row.select_one("td.box div")
         status = (status_div.get_text(" ", strip=True) if status_div else None)
 
+        # capacity/free
         cap_div = row.select_one('div[class*="capacity_entry"]')
         free_val, cap_val = (None, None)
         if cap_div:
@@ -114,13 +143,14 @@ def _parse_lv_table(pp_id: str, soup_lv: BeautifulSoup) -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
+        # waitlist
         waitlist = None
         wl_div = row.select_one('td.capacity div[title*="Anzahl Warteliste"]')
         if wl_div:
             span = wl_div.find("span")
             waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
 
-        rows_out.append({
+        out.append({
             "pp": str(pp_id),
             "lv": str(lv_id),
             "title": title,
@@ -131,7 +161,10 @@ def _parse_lv_table(pp_id: str, soup_lv: BeautifulSoup) -> List[Dict[str, Any]]:
             "free": free_val,
             "waitlist": waitlist,
         })
-    return rows_out
+
+        if cap and len(out) >= cap:
+            return True  # stop early
+    return False
 
 def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
     """Full index build for a user account; returns flat list of all LVs."""
@@ -193,7 +226,8 @@ def _build_index(username: str, password: str) -> List[Dict[str, Any]]:
 
         res2 = client.browser.open(client.URL_scraped + lv_url_rel)
         soup_lv = BeautifulSoup(res2.read(), "html.parser")
-        items.extend(_parse_lv_table(pp_id, soup_lv))
+        # parse all rows for this PP (no query filter in the builder)
+        _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=items)
 
     return items
 
@@ -209,22 +243,102 @@ def _ensure_index(username: str, password: str, force: bool = False):
             return
 
         if not entry:
-            entry = {"items": [], "updated": 0.0, "building": False}
+            entry = {"items": [], "updated": 0.0, "building": False,
+                     "last_error": None, "build_started": None, "build_finished": None}
             _CACHE[username] = entry
 
         def _worker():
+            entry["building"] = True
+            entry["last_error"] = None
+            entry["build_started"] = _now()
+            entry["build_finished"] = None
             try:
-                entry["building"] = True
                 items = _build_index(username, password)
                 entry["items"] = items
                 entry["updated"] = _now()
-            except Exception:
-                # keep old snapshot on failure
-                pass
+            except Exception as e:
+                entry["last_error"] = str(e)[:500]
             finally:
                 entry["building"] = False
+                entry["build_finished"] = _now()
 
         threading.Thread(target=_worker, daemon=True).start()
+
+def _provisional_scan(username: str, password: str, q: str, limit: Optional[int], timeout_ms: int = 900) -> List[Dict[str, Any]]:
+    """
+    Quick, best-effort scan for first-time requests so we don't return empty while cache builds.
+    Hard time-bounded; returns whatever it finds within timeout_ms.
+    """
+    start = _now()
+    client = get_lpis_client(username, password)
+
+    # reach overview
+    try:
+        client.ensure_overview()
+    except Exception:
+        pass
+
+    # select form
+    selected = False
+    try:
+        client.browser.select_form("ea_stupl")
+        selected = True
+    except Exception:
+        for frm in client.browser.forms():
+            try:
+                client.browser.form = frm
+                _ = client.browser.form.find_control("ASPP")
+                selected = True
+                break
+            except Exception:
+                continue
+    if not selected:
+        return []
+
+    try:
+        item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
+        item.selected = True
+    except Exception:
+        pass
+
+    r = client.browser.submit()
+    soup = BeautifulSoup(r.read(), "html.parser")
+
+    tokens = [_norm(t) for t in (q or "").split() if t]
+    cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
+    out: List[Dict[str, Any]] = []
+
+    table = soup.find("table", {"class": "b3k-data"})
+    tbody = table.find("tbody") if table else None
+    rows = tbody.find_all("tr") if tbody else []
+
+    for planpunkt in rows:
+        if (_now() - start) * 1000 > timeout_ms:
+            break  # time budget exhausted
+
+        a_tag = planpunkt.find("a")
+        if not (a_tag and a_tag.get("id")):
+            continue
+        pp_id = a_tag["id"][1:]
+
+        link_lv = planpunkt.select_one('a[href*="DLVO"]')
+        if not link_lv:
+            continue
+        lv_url_rel = (link_lv.get("href", "") or "").strip()
+        if not lv_url_rel:
+            continue
+
+        try:
+            res2 = client.browser.open(client.URL_scraped + lv_url_rel)
+            soup_lv = BeautifulSoup(res2.read(), "html.parser")
+        except Exception:
+            continue
+
+        # parse minimal LV rows and apply filter
+        if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
+            break
+
+    return out
 
 # ---------------- Endpoints ----------------
 
@@ -239,22 +353,26 @@ def healthz():
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
-    Ultra-fast: returns from cache (ms). If cache is stale/missing, triggers a background rebuild.
+    Ultra-fast on warm cache. If cache is cold or building, return a provisional
+    result gathered within ~900 ms so the UI never shows an empty list.
     Query semantics:
       - AND over tokens; matches title + lecturers + LV id.
       - limit=0 or None => no cap.
     """
     try:
-        # Kick off a rebuild if needed, but do NOT block the response.
+        # Kick off (or continue) background build, but don't block.
         _ensure_index(p.username, p.password, force=False)
 
-        # Read current snapshot
+        # Snapshot current cache
         with _CACHE_LOCK:
-            entry = _CACHE.get(p.username) or {"items": [], "updated": 0.0, "building": False}
+            entry = _CACHE.get(p.username) or {"items": [], "updated": 0.0, "building": False,
+                                               "last_error": None, "build_started": None, "build_finished": None}
             items_snapshot = list(entry.get("items", []))
             updated = entry.get("updated", 0.0)
             building = bool(entry.get("building"))
+            last_error = entry.get("last_error")
 
+        # Filter snapshot
         tokens = [_norm(t) for t in (p.q or "").split() if t]
         cap = int(p.limit) if (isinstance(p.limit, int) and p.limit and p.limit > 0) else None
 
@@ -265,14 +383,28 @@ def courses_search(p: SearchIn):
                 if cap and len(out) >= cap:
                     break
 
+        # If snapshot is empty (or not fresh) and we have a query, do a quick provisional scan
+        provisional_used = False
+        if (not out) and tokens:
+            try:
+                # Hard cap ~900ms; tune to 700–1200ms
+                prov = _provisional_scan(p.username, p.password, p.q, p.limit, timeout_ms=900)
+                if prov:
+                    out = prov[: (cap or len(prov))]
+                    provisional_used = True
+            except Exception:
+                pass
+
         return {
             "ok": True,
             "items": out,
             "meta": {
-                "cached": True,
+                "cached": bool(items_snapshot),
                 "updated_at_unix": updated,
                 "building": building,
-                "fresh": ( _now() - updated ) < INDEX_TTL_SECONDS
+                "fresh": (_now() - updated) < INDEX_TTL_SECONDS if updated else False,
+                "provisional": provisional_used,
+                "last_error": last_error,
             }
         }
 
@@ -296,8 +428,30 @@ def courses_reindex(p: ReindexIn):
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
+@app.get("/courses/index_status")
+def index_status(username: str):
+    with _CACHE_LOCK:
+        entry = _CACHE.get(username)
+        if not entry:
+            return {"ok": True, "exists": False}
+        return {
+            "ok": True,
+            "exists": True,
+            "building": entry.get("building"),
+            "updated_at_unix": entry.get("updated"),
+            "items_cached": len(entry.get("items") or []),
+            "fresh": _is_fresh(entry),
+            "last_error": entry.get("last_error"),
+            "build_started": entry.get("build_started"),
+            "build_finished": entry.get("build_finished"),
+        }
+
 @app.post("/debug/structure")
 def debug_structure(p: SearchIn):
+    """
+    TEMP endpoint to introspect what the scraper sees after login.
+    Do not expose publicly in production.
+    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
@@ -309,6 +463,7 @@ def debug_structure(p: SearchIn):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LPIS navigation failed: {e}")
 
+    # Normalize potential structures
     normalized = data
     if hasattr(client, "getResults") and "data" not in normalized:
         try:
@@ -330,12 +485,17 @@ def debug_structure(p: SearchIn):
 
 @app.post("/debug/forms")
 def debug_forms(p: SearchIn):
+    """
+    Lists form names and their controls from the current mechanize context after ensure_overview().
+    Helpful when LPIS instances differ in form naming.
+    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
 
     client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
+    # open post-login base and try to reach overview
     try:
         client.ensure_overview()
     except Exception as e:
