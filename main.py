@@ -20,7 +20,7 @@ app = FastAPI()
 # ---------------- Config ----------------
 INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
 REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 2000      # ~2s best-effort provisional scan
+PROVISIONAL_TIMEOUT_MS = 900      # ~2s best-effort provisional scan
 
 # --------------- Models -----------------
 class SearchIn(BaseModel):
@@ -666,7 +666,7 @@ def whoami():
 def courses_search(p: SearchIn):
     """
     Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
-    - run ~2s provisional scan,
+    - run ~900ms provisional scan,
     - then try a relaxed OR-match on cache,
     - finally a broad provisional scan and OR-filter (final fallback),
     - and if still empty, DO A DIRECT infos() FETCH (pre-enroll behavior) to guarantee results.
