@@ -722,6 +722,8 @@ def courses_reindex_sync(p: ReindexIn, max_pp: int = 5):
         return {"ok": True, "seeded": len(items), "ms": int((_now()-start)*1000)}
     except Exception as e:
         return JSONResponse(status_code=502, content={"ok": False, "error": str(e)})
+
+
 # --- SEARCH (cache + provisional + relaxed fallback) ---
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
@@ -826,16 +828,33 @@ def courses_search(p: SearchIn):
         tb = traceback.format_exc(limit=5)
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e), "trace": tb[:4000]})
 
-@app.post("/courses/reindex")
-def courses_reindex(p: ReindexIn):
-    """Start a background reindex for this account."""
+@app.post("/courses/reindex_sync")
+def reindex_sync(p: ReindexIn):
+    if not p.username or not p.password:
+        raise HTTPException(status_code=400, detail="Missing credentials")
+
     try:
-        _ensure_index(p.username, p.password, force=True)
-        return {"ok": True, "queued": True}
-    except HTTPException as he:
-        return JSONResponse(status_code=he.status_code, content={"ok": False, "error": he.detail})
+        # Debug log before building
+        print(f"[reindex_sync] Starting full build for {p.username}")
+        items = _build_index(p.username, p.password)
+        # Atomically replace cache
+        with _CACHE_LOCK:
+            _CACHE[p.username] = {
+                "items": items,
+                "updated": _now(),
+                "building": False,
+                "last_error": None,
+                "build_started": None,
+                "build_finished": _now(),
+            }
+        # Debug log after building
+        print(f"[reindex_sync] Built {len(items)} items for {p.username}")
+        return {"ok": True, "seeded": len(items)}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        tb = traceback.format_exc(limit=5)
+        print(f"[reindex_sync] ERROR: {e}\n{tb}")
+        raise HTTPException(status_code=502, detail=str(e))
+
 
 @app.get("/courses/index_status")
 def index_status(username: str):
