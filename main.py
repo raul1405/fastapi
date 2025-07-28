@@ -68,3 +68,24 @@ def courses_search(p: SearchIn):
         res = client.getResults()
     items = extract_items(res, p.q, p.limit)
     return {"ok": True, "items": items}
+
+# main.py — add:
+from fastapi import HTTPException
+
+@app.post("/debug/structure")
+def debug_structure(p: SearchIn):
+    try:
+        from lpislib import WuLpisApi
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
+    client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
+    data = client.infos()
+    pp = (data or {}).get("pp") or {}
+    total_lvs = sum(len((pp[k].get("lvs") or {})) for k in pp)
+    return {
+        "ok": True,
+        "studies_count": (data or {}).get("studies_count"),
+        "pp_count": len(pp),
+        "lv_total": total_lvs,
+        "sample_pp_ids": list(pp.keys())[:5],
+    }
