@@ -1,38 +1,57 @@
 # main.py
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
+import traceback
 
 app = FastAPI()
 
+
+# ---------- Health & Root ----------
 @app.get("/")
 def root():
     return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
+
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
+
+# ---------- Models ----------
 class SearchIn(BaseModel):
     username: str
     password: str
-    q: str
+    q: str = ""
     limit: Optional[int] = 20
 
+
+# ---------- Helpers ----------
 def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[Dict[str, Any]]:
+    """
+    Normalize LPIS structure to a flat course list used by the UI.
+    """
     items: List[Dict[str, Any]] = []
-    data = (result or {}).get("data") or {}
+
+    # result can be either:
+    #  - {"data": {"pp": {...}}, "status": {...}}  (from getResults())
+    #  - {"pp": {...}, ...}                        (direct infos() return)
+    data = (result or {}).get("data") or result or {}
     pp_map = data.get("pp") or {}
+
     q_lower = (q or "").strip().lower()
 
     for pp_id, pp_obj in pp_map.items():
         lvs = (pp_obj or {}).get("lvs") or {}
         for lv_id, lv in lvs.items():
             title = (lv or {}).get("name") or ""
-            prof  = (lv or {}).get("prof") or ""
-            hay   = f"{title} {prof}".lower()
+            prof = (lv or {}).get("prof") or ""
+            hay = f"{title} {prof}".lower()
+
             if q_lower and q_lower not in hay:
                 continue
+
             items.append({
                 "pp": str(pp_id),
                 "lv": str(lv_id),
@@ -48,43 +67,81 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
                 return items
     return items
 
+
 def get_lpis_client(user: str, pw: str):
-    # Lazy import – avoids startup crash if deps are missing
+    """
+    Lazy import WuLpisApi and construct a client.
+    Returns HTTPException with proper codes on failure so callers can propagate.
+    """
     try:
-        from lpislib import WuLpisApi
+        from lpislib import WuLpisApi  # vendored package
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
     try:
         return WuLpisApi(user, pw, args=None, sessiondir=None)
     except Exception as e:
-        # bubble up login/parse errors
+        # Login/redirect/parse errors → treat as upstream failure
         raise HTTPException(status_code=502, detail=str(e))
 
+
+# ---------- Endpoints ----------
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
-    client = get_lpis_client(p.username, p.password)
-    res = client.infos()
-    if hasattr(client, "getResults"):
-        res = client.getResults()
-    items = extract_items(res, p.q, p.limit)
-    return {"ok": True, "items": items}
+    """
+    Logs in to LPIS, scrapes the study plan, filters LVs by 'q', returns a flat list.
+    """
+    try:
+        client = get_lpis_client(p.username, p.password)  # may raise HTTPException(500/502)
+        res = client.infos()
+        # Many WuLpisApi builds also expose getResults(); prefer normalized output if available
+        if hasattr(client, "getResults"):
+            res = client.getResults()
+        items = extract_items(res, p.q, p.limit)
+        return {"ok": True, "items": items}
+    except HTTPException as he:
+        # Propagate known HTTP errors with a small JSON body
+        return JSONResponse(status_code=he.status_code, content={"ok": False, "error": he.detail})
+    except Exception as e:
+        # Return useful debug details (no secrets); helps diagnose quickly
+        tb = traceback.format_exc(limit=5)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "trace": tb[:4000]},
+        )
 
-# main.py — add:
-from fastapi import HTTPException
 
 @app.post("/debug/structure")
 def debug_structure(p: SearchIn):
+    """
+    TEMP endpoint to introspect what the scraper sees after login.
+    Do not expose publicly in production.
+    """
     try:
         from lpislib import WuLpisApi
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
-    client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
-    data = client.infos()
-    pp = (data or {}).get("pp") or {}
-    total_lvs = sum(len((pp[k].get("lvs") or {})) for k in pp)
+
+    try:
+        client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
+        data = client.infos()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LPIS navigation failed: {e}")
+
+    # Normalize potential structures
+    normalized = data
+    if hasattr(client, "getResults"):
+        try:
+            normalized = client.getResults()
+        except Exception:
+            pass
+
+    dat = (normalized or {}).get("data") or normalized or {}
+    pp = dat.get("pp") or {}
+    total_lvs = sum(len((v or {}).get("lvs") or {}) for v in pp.values())
+
     return {
         "ok": True,
-        "studies_count": (data or {}).get("studies_count"),
+        "studies_count": dat.get("studies_count"),
         "pp_count": len(pp),
         "lv_total": total_lvs,
         "sample_pp_ids": list(pp.keys())[:5],
