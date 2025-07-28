@@ -422,6 +422,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
     """
     Findet die LV-Zeile (lv_id), wählt das zugehörige Formular und submitted.
     Versucht optional group_id / Warteliste zu setzen.
+    Erkennt 'Anmeldung nicht möglich' vorab und 'Bestätigen'-Zwischenseite.
     """
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
@@ -429,6 +430,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
         raise HTTPException(status_code=502, detail="LV table not present on DLVO page.")
 
     target_form_name = None
+    pre_status_txt = ""
     for row in lv_body.find_all("tr"):
         ver_id_link = row.select_one(".ver_id a")
         if not ver_id_link:
@@ -437,6 +439,10 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
         if cur_lv != str(lv_id):
             continue
 
+        # Status in der Zeile (z. B. "Anmeldung nicht möglich")
+        status_div = row.select_one("td.box div")
+        pre_status_txt = (status_div.get_text(" ", strip=True) if status_div else "").strip().lower()
+
         form = row.select_one("td.action form")
         if form and form.get("name"):
             target_form_name = form["name"]
@@ -444,6 +450,10 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
 
     if not target_form_name:
         raise HTTPException(status_code=404, detail=f"LV {lv_id} not found or no enroll form present.")
+
+    # Vorab: klarer "closed"-Status ohne Submit
+    if any(k in pre_status_txt for k in ["nicht möglich", "gesperrt", "geschlossen"]):
+        return {"result": "closed", "message": "Anmeldung derzeit nicht möglich (laut LV-Status)."}
 
     # entsprechendes Formular auswählen
     try:
@@ -458,7 +468,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
         if not matched:
             raise HTTPException(status_code=502, detail="Enroll form not selectable in mechanize context.")
 
-    # Gruppe setzen (best-effort; Feldnamen variieren zwischen Studien)
+    # Gruppe setzen (best-effort)
     if group_id:
         for possible in ["GRUPPE", "group", "GROUP", "grp", "gruppe", "GRP_ID", "GRUPPE_ID"]:
             try:
@@ -473,15 +483,14 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
             except Exception:
                 continue
 
-    # Warteliste, wenn Kapazität voll und auto_waitlist aktiv
+    # Warteliste, wenn aktiv
     if auto_waitlist:
         for ctrl in getattr(client.browser.form, "controls", []):
-            # Versuche "Warteliste"-Option/Radio zu identifizieren
             try:
-                if hasattr(ctrl, "items"):
+                # Select/Radio-Items mit Label "Warteliste"
+                if hasattr(ctrl, "items") and ctrl.items:
                     for item in ctrl.items:
                         try:
-                            # manche Controls haben label/name via get_labels()
                             labels = []
                             try:
                                 labels = [l.text.lower() for l in item.get_labels()]
@@ -491,17 +500,55 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
                                 item.selected = True
                         except Exception:
                             continue
-                # einfache Heuristik bei value
+                # Fallback value-Heuristik
                 val = getattr(ctrl, "value", None)
                 if isinstance(val, str) and "wart" in val.lower():
                     ctrl.value = val
             except Exception:
                 continue
 
+    # 1. Submit
     r3 = client.browser.submit()
     soup3 = BeautifulSoup(r3.read(), "html.parser")
     page_text = soup3.get_text(" ", strip=True).lower()
 
+    # Erkennen einer Bestätigungsseite (zweiter Schritt)
+    confirm_needed = any(k in page_text for k in [
+        "bestätigen", "bestaetigen", "überprüfen", "ueberpruefen"
+    ]) and not any(k in page_text for k in [
+        "erfolgreich", "warteliste", "bereits angemeldet"
+    ])
+
+    if confirm_needed:
+        # Versuche ein Formular auszuwählen, das wie "bestaetigen" / "confirm" aussieht
+        picked = False
+        try:
+            for frm in client.browser.forms():
+                nm = (getattr(frm, "name", "") or "").lower()
+                if any(x in nm for x in ["bestaet", "bestät", "confirm"]):
+                    client.browser.form = frm
+                    picked = True
+                    break
+        except Exception:
+            pass
+
+        if not picked:
+            # Fallback: wähle das erste Formular
+            try:
+                client.browser.form = next(iter(client.browser.forms()))
+                picked = True
+            except Exception:
+                picked = False
+
+        if picked:
+            try:
+                r4 = client.browser.submit()
+                soup4 = BeautifulSoup(r4.read(), "html.parser")
+                page_text = soup4.get_text(" ", strip=True).lower()
+            except Exception:
+                pass
+
+    # Ergebnis-Detektion
     if any(k in page_text for k in ["erfolgreich angemeldet", "anmeldung erfolgreich", "erfolgreich durchgef"]):
         return {"result": "success", "message": "Anmeldung erfolgreich."}
     if "warteliste" in page_text or "auf die warteliste" in page_text:
@@ -511,8 +558,19 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
     if any(k in page_text for k in ["nicht möglich", "gesperrt", "geschlossen"]):
         return {"result": "closed", "message": "Anmeldung derzeit nicht möglich."}
 
-    # Unklar – Seite zurückgeben wäre zu groß; wir geben unknown
-    return {"result": "unknown", "message": "Status unklar – bitte im LPIS prüfen."}
+    # Diagnose zurückgeben
+    # (kleiner Text-Ausschnitt + Formular-Namen)
+    forms = []
+    try:
+        forms = [getattr(f, "name", None) for f in client.browser.forms()]
+    except Exception:
+        pass
+    snippet = page_text[:600]
+    return {
+        "result": "unknown",
+        "message": "Status unklar – bitte im LPIS prüfen.",
+        "debug": {"snippet": snippet, "forms": forms}
+    }
 
 # ---------------- Endpoints ----------------
 
