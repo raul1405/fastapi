@@ -662,7 +662,66 @@ def root():
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+@app.post("/courses/reindex_sync")
+def courses_reindex_sync(p: ReindexIn, max_pp: int = 5):
+    try:
+        start = _now()
+        items: List[Dict[str, Any]] = []
+        client = get_lpis_client(p.username, p.password)
+        try:
+            client.ensure_overview()
+        except Exception:
+            pass
+        # reach plan table
+        selected = False
+        try:
+            client.browser.select_form("ea_stupl")
+            selected = True
+        except Exception:
+            for frm in client.browser.forms():
+                try:
+                    client.browser.form = frm
+                    _ = client.browser.form.find_control("ASPP")
+                    selected = True
+                    break
+                except Exception:
+                    continue
+        if not selected:
+            return JSONResponse(status_code=502, content={"ok": False, "error":"study-plan form not found"})
+        try:
+            item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
+            item.selected = True
+        except Exception:
+            pass
+        r = client.browser.submit()
+        soup = BeautifulSoup(r.read(), "html.parser")
 
+        table = soup.find("table", {"class": "b3k-data"})
+        tbody = table.find("tbody") if table else None
+        rows = (tbody.find_all("tr") if tbody else [])[:max_pp]
+
+        for planpunkt in rows:
+            a_tag = planpunkt.find("a")
+            if not (a_tag and a_tag.get("id")): 
+                continue
+            pp_id = a_tag["id"][1:]
+            link_lv = planpunkt.select_one('a[href*="DLVO"]')
+            if not link_lv: 
+                continue
+            href = (link_lv.get("href") or "").strip()
+            res2 = client.browser.open(client.URL_scraped + href)
+            soup_lv = BeautifulSoup(res2.read(), "html.parser")
+            _parse_lv_rows_fast(pp_id, soup_lv, tokens=[], cap=None, out=items)
+
+        with _CACHE_LOCK:
+            entry = _CACHE.setdefault(p.username, {"items": [], "updated": 0.0, "building": False,
+                                                   "last_error": None, "build_started": None, "build_finished": None})
+            entry["items"] = items
+            entry["updated"] = _now()
+
+        return {"ok": True, "seeded": len(items), "ms": int((_now()-start)*1000)}
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "error": str(e)})
 # --- SEARCH (cache + provisional + relaxed fallback) ---
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
