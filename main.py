@@ -19,7 +19,7 @@ app = FastAPI()
 # ---------------- Config ----------------
 INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
 REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
-PROVISIONAL_TIMEOUT_MS = 2000       # ~1s best-effort provisional scan
+PROVISIONAL_TIMEOUT_MS = 2000      # ~2s best-effort provisional scan
 
 # --------------- Models -----------------
 class SearchIn(BaseModel):
@@ -97,7 +97,7 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
                         cap: Optional[int], out: List[Dict[str, Any]]) -> bool:
     """
     Parse a PP's LV table quickly and append only matching rows to 'out'.
-    Returns True if cap reached and caller can stop.
+    Robust title extraction for LPIS variants. Returns True if cap reached.
     """
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
@@ -120,22 +120,39 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
         prof_div = row.select_one(".ver_title div")
         prof = (prof_div.get_text(" ", strip=True) if prof_div else "").strip()
 
-        # title
+        # -------- ROBUST TITLE EXTRACTION --------
         name_td = row.find("td", {"class": "ver_title"})
         title = ""
+        fallback_full = ""
         if name_td:
-            title_el = name_td.select_one("a, strong, span")
-            title = (title_el.get_text(" ", strip=True) if title_el else name_td.get_text(" ", strip=True)).strip()
-            if prof:
-                title = re.sub(re.escape(prof) + r"\s*$", "", title).strip(" -·•\u00A0")
-            title = re.sub(r"\s+", " ", title).strip()
+            # Full text in the title cell (often "Prof · Course Title")
+            fallback_full = (name_td.get_text(" ", strip=True) or "").strip()
 
-        # fast matching
-        if tokens:
-            hay = " ".join(filter(None, [title, prof, lv_id]))
-            hay_n = _norm(hay)
-            if not all(t in hay_n for t in tokens):
-                continue
+            # 1) Prefer bare text nodes (outside children), last one tends to be the course title
+            bare_texts = [t.strip() for t in name_td.find_all(string=True, recursive=False) if (t or "").strip()]
+            if bare_texts:
+                title = bare_texts[-1]
+
+            # 2) If empty, try a prominent child (a/strong/span)
+            if not title:
+                el = name_td.select_one("a, strong, span")
+                if el:
+                    title = (el.get_text(" ", strip=True) or "").strip()
+
+            # 3) If the cell equals the prof (happens on some layouts), remove prof and clean
+            if title and prof and _norm(title) == _norm(prof):
+                title = ""
+
+            # 4) Last resort: compute title from full cell text minus prof suffix
+            if (not title) and fallback_full:
+                if prof and fallback_full.lower().endswith(prof.lower()):
+                    title = re.sub(re.escape(prof) + r"\s*$", "", fallback_full).strip(" -·•\u00A0")
+                else:
+                    title = fallback_full
+
+            # 5) Normalize excess spaces
+            title = re.sub(r"\s+", " ", title or "").strip()
+        # ----------------------------------------
 
         status_div = row.select_one("td.box div")
         status = (status_div.get_text(" ", strip=True) if status_div else None)
@@ -158,6 +175,13 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
         if wl_div:
             span = wl_div.find("span")
             waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
+
+        # ---- matching (allowing provisional filters to work) ----
+        if tokens:
+            hay = " ".join(filter(None, [title, prof, lv_id, fallback_full]))
+            hay_n = _norm(hay)
+            if not all(t in hay_n for t in tokens):
+                continue
 
         out.append({
             "pp": str(pp_id),
@@ -571,8 +595,9 @@ def healthz():
 def courses_search(p: SearchIn):
     """
     Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
-    - run ~1–1.5s provisional scan,
-    - if still empty, run a broad provisional scan, then OR-filter in Python.
+    - run ~2s provisional scan,
+    - then try a relaxed OR-match on cache,
+    - finally a broad provisional scan and OR-filter (final fallback).
     """
     try:
         _ensure_index(p.username, p.password, force=False)
@@ -630,7 +655,7 @@ def courses_search(p: SearchIn):
         # Pass 3: broad provisional scan then OR-filter (final fallback while cache builds)
         if (not out) and tokens:
             try:
-                broad = _provisional_scan(p.username, p.password, "", max(p.limit or 20, 40),
+                broad = _provisional_scan(p.username, p.password, "", max(p.limit or 20, 50),
                                           timeout_ms=PROVISIONAL_TIMEOUT_MS)
                 if broad:
                     filtered = []
