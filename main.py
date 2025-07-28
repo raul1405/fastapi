@@ -92,17 +92,20 @@ def courses_search(p: SearchIn):
     """
     try:
         client = get_lpis_client(p.username, p.password)  # may raise HTTPException(500/502)
-        res = client.infos()
-        # Many WuLpisApi builds also expose getResults(); prefer normalized output if available
-        if hasattr(client, "getResults"):
+
+        # first try infos(), else getResults()
+        if hasattr(client, "infos"):
+            res = client.infos()
+        elif hasattr(client, "getResults"):
             res = client.getResults()
+        else:
+            raise HTTPException(status_code=500, detail="LPIS client missing both infos() and getResults()")
+
         items = extract_items(res, p.q, p.limit)
         return {"ok": True, "items": items}
     except HTTPException as he:
-        # Propagate known HTTP errors with a small JSON body
         return JSONResponse(status_code=he.status_code, content={"ok": False, "error": he.detail})
     except Exception as e:
-        # Return useful debug details (no secrets); helps diagnose quickly
         tb = traceback.format_exc(limit=5)
         return JSONResponse(
             status_code=500,
@@ -123,13 +126,13 @@ def debug_structure(p: SearchIn):
 
     try:
         client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
-        data = client.infos()
+        data = client.infos() if hasattr(client, "infos") else client.getResults()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LPIS navigation failed: {e}")
 
     # Normalize potential structures
     normalized = data
-    if hasattr(client, "getResults"):
+    if hasattr(client, "getResults") and "data" not in normalized:
         try:
             normalized = client.getResults()
         except Exception:
