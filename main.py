@@ -307,24 +307,28 @@ def _ensure_index(username: str, password: str, force: bool = False):
         threading.Thread(target=_worker, daemon=True).start()
 
 # ---------- Provisional scan (true fast path) ----------
+# replace the whole _provisional_scan with this version
 def _provisional_scan(username: str, password: str, q: str, limit: Optional[int],
                       timeout_ms: int = PROVISIONAL_TIMEOUT_MS) -> List[Dict[str, Any]]:
     """
-    Run a quick best-effort scan with a SHORT per-request timeout so the whole
-    operation stays under ~timeout_ms even if LPIS endpoints are slow.
+    Staged fast path:
+      - LOGIN & first submit with a slightly higher timeout (~4s) to survive TLS/redirects
+      - LV page fetches with short timeout (~1.8s) to keep total under a few seconds
     """
+    LOGIN_TIMEOUT = 4.0
+    PAGE_TIMEOUT  = PROVISIONAL_NET_TIMEOUT  # 1.8s from config
     start = _now()
     out: List[Dict[str, Any]] = []
 
-    with _temp_socket_timeout(PROVISIONAL_NET_TIMEOUT):
+    # 1) Login + reach PP table (allow up to ~4s per call)
+    with _temp_socket_timeout(LOGIN_TIMEOUT):
         client = get_lpis_client(username, password)
-
         try:
             client.ensure_overview()
         except Exception:
             pass
 
-        # Reach study-plan form
+        # Select study-plan form
         selected = False
         try:
             client.browser.select_form("ea_stupl")
@@ -341,88 +345,91 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         if not selected:
             return []
 
+        # Preselect first ASPP option
         try:
             item = client.browser.form.find_control("ASPP").get(None, None, None, 0)
             item.selected = True
         except Exception:
             pass
 
+        # Submit to show planpunkte table
         try:
             r = client.browser.submit()
         except Exception:
             return []
         soup = BeautifulSoup(r.read(), "html.parser")
 
-        tokens = [_norm(t) for t in (q or "").split() if t]
-        cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
+    # 2) Decide which PPs to open (cheap, no network)
+    tokens = [_norm(t) for t in (q or "").split() if t]
+    cap = int(limit) if (isinstance(limit, int) and limit and limit > 0) else 10
 
-        table = soup.find("table", {"class": "b3k-data"})
-        tbody = table.find("tbody") if table else None
-        rows = tbody.find_all("tr") if tbody else []
+    table = soup.find("table", {"class": "b3k-data"})
+    tbody = table.find("tbody") if table else None
+    rows = tbody.find_all("tr") if tbody else []
 
-        candidates = []  # (priority, pp_id, lv_url_rel)
-        for planpunkt in rows:
-            if (_now() - start) * 1000 > timeout_ms:
-                break
+    candidates = []  # (priority, pp_id, lv_url_rel)
+    for planpunkt in rows:
+        if (_now() - start) * 1000 > timeout_ms:
+            break
 
-            a_tag = planpunkt.find("a")
-            if not (a_tag and a_tag.get("id")):
-                continue
-            pp_id = a_tag["id"][1:]
+        a_tag = planpunkt.find("a")
+        if not (a_tag and a_tag.get("id")):
+            continue
+        pp_id = a_tag["id"][1:]
 
-            link_lv = planpunkt.select_one('a[href*="DLVO"]')
-            if not link_lv:
-                continue
-            lv_url_rel = (link_lv.get("href", "") or "").strip()
-            if not lv_url_rel:
-                continue
+        link_lv = planpunkt.select_one('a[href*="DLVO"]')
+        if not link_lv:
+            continue
+        lv_url_rel = (link_lv.get("href", "") or "").strip()
+        if not lv_url_rel:
+            continue
 
-            span1 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(1)")
-            span2 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(2)")
-            pp_type = (span1.get_text(" ", strip=True) if span1 else "").strip()
-            pp_name = (span2.get_text(" ", strip=True) if span2 else "").strip()
-            if not pp_name:
-                second_td = planpunkt.select_one("td:nth-of-type(2)")
-                pp_name = (second_td.get_text(" ", strip=True) if second_td else "").strip()
+        # Use PP type+name to prioritize likely matches
+        span1 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(1)")
+        span2 = planpunkt.select_one("td:nth-of-type(1) span:nth-of-type(2)")
+        pp_type = (span1.get_text(" ", strip=True) if span1 else "").strip()
+        pp_name = (span2.get_text(" ", strip=True) if span2 else "").strip()
+        if not pp_name:
+            second_td = planpunkt.select_one("td:nth-of-type(2)")
+            pp_name = (second_td.get_text(" ", strip=True) if second_td else "").strip()
 
-            hay = _norm(" ".join([pp_type, pp_name]))
-            priority = 1
-            if tokens and any(t in hay for t in tokens):
-                priority = 0
+        hay = _norm(" ".join([pp_type, pp_name]))
+        priority = 1
+        if tokens and any(t in hay for t in tokens):
+            priority = 0
 
-            candidates.append((priority, pp_id, lv_url_rel))
+        candidates.append((priority, pp_id, lv_url_rel))
 
-        candidates.sort(key=lambda x: x[0])
-        # open only a few PP pages in provisional
-        if tokens:
-            candidates = candidates[:3]
-        else:
-            candidates = candidates[:2]
+    candidates.sort(key=lambda x: x[0])
+    # open only a few PPs; allow a bit more when tokens exist
+    candidates = candidates[:5] if tokens else candidates[:3]
 
+    # 3) Open LV pages fast (short timeout) and parse
+    with _temp_socket_timeout(PAGE_TIMEOUT):
         for priority, pp_id, lv_url_rel in candidates:
             if (_now() - start) * 1000 > timeout_ms:
                 break
             try:
-                # mechanize.Browser.open may accept timeout; guard fallback
                 try:
-                    res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PROVISIONAL_NET_TIMEOUT)
+                    res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PAGE_TIMEOUT)
                 except TypeError:
                     res2 = client.browser.open(client.URL_scraped + lv_url_rel)
                 soup_lv = BeautifulSoup(res2.read(), "html.parser")
             except Exception:
                 continue
 
+            # Strict AND match first
             if _parse_lv_rows_fast(pp_id, soup_lv, tokens, cap, out):
                 break
 
-        # relaxed OR pass (very small) if still empty and time left
+        # If still empty and time left, do a tiny relaxed OR pass on top candidates
         if not out and tokens and ((_now() - start) * 1000) <= timeout_ms:
             for priority, pp_id, lv_url_rel in candidates[:2]:
                 if (_now() - start) * 1000 > timeout_ms:
                     break
                 try:
                     try:
-                        res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PROVISIONAL_NET_TIMEOUT)
+                        res2 = client.browser.open(client.URL_scraped + lv_url_rel, timeout=PAGE_TIMEOUT)
                     except TypeError:
                         res2 = client.browser.open(client.URL_scraped + lv_url_rel)
                     soup_lv = BeautifulSoup(res2.read(), "html.parser")
