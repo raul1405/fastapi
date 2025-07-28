@@ -11,21 +11,15 @@ import socket
 import re
 import time
 
-# mechanize-basierter LPIS-Client (lokal vendored)
-# lpislib/__init__.py exportiert WuLpisApi
-# lpislib/WuLpisApiClass.py enthält die Scraper-Logik
-# -> bereits im Repo vorhanden
-# get_lpis_client() importiert dynamisch unten
-
-# Harter Timeout je HTTP-Call, damit nichts "hängen" bleibt
+# Hard timeouts so requests can't hang forever
 socket.setdefaulttimeout(8)
 
 app = FastAPI()
 
 # ---------------- Config ----------------
-INDEX_TTL_SECONDS = 600   # 10 Minuten für Cache
-REBUILD_TIME_BUDGET = 25  # Max. Sekunden für Vollindex in einem Lauf
-PROVISIONAL_TIMEOUT_MS = 900  # ~1s Quick-Scan wenn Cache kalt
+INDEX_TTL_SECONDS = 600            # 10 minutes cache TTL
+REBUILD_TIME_BUDGET = 25           # seconds budget for full index build
+PROVISIONAL_TIMEOUT_MS = 900       # ~1s best-effort provisional scan
 
 # --------------- Models -----------------
 class SearchIn(BaseModel):
@@ -37,7 +31,7 @@ class SearchIn(BaseModel):
 class ReindexIn(BaseModel):
     username: str
     password: str
-    pp_ids: Optional[List[str]] = None  # bisher ungenutzt
+    pp_ids: Optional[List[str]] = None  # not used yet
 
 class EnrollIn(BaseModel):
     username: str
@@ -85,12 +79,12 @@ def _matches(tokens: List[str], title: str, prof: str, lv_id: str) -> bool:
         return True
     hay = " ".join(filter(None, [title, prof, str(lv_id)]))
     hay_n = _norm(hay)
-    return all(t in hay_n for t in tokens)
+    return all(t in hay_n for t in tokens)  # strict AND
 
 # -------------- LPIS client -------------
 def get_lpis_client(user: str, pw: str):
     try:
-        from lpislib import WuLpisApi
+        from lpislib import WuLpisApi  # vendored client
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
     try:
@@ -354,10 +348,8 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
 
 def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
     """
-    Nach Login/ensure_overview() die Studienplan-Tabelle anzeigen und
-    die DLVO-URL des gewünschten Planpunkts (pp_id) öffnen.
+    After login/ensure_overview(): show plan table and open DLVO page for given PP.
     """
-    # Formular wählen und abschicken
     selected = False
     try:
         client.browser.select_form("ea_stupl")
@@ -383,10 +375,11 @@ def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
     r = client.browser.submit()
     soup = BeautifulSoup(r.read(), "html.parser")
 
-    # DLVO-Link für PP suchen
+    # find DLVO link for PP
     table = soup.find("table", {"class": "b3k-data"})
     tbody = table.find("tbody") if table else None
     rows = tbody.find_all("tr") if tbody else []
+
     dlvo_href = None
     for planpunkt in rows:
         a_tag = planpunkt.find("a")
@@ -400,7 +393,7 @@ def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
             dlvo_href = (link_lv.get("href") or "").strip()
             break
 
-    # Fallback über infos()
+    # fallback via infos()
     if not dlvo_href:
         try:
             data = client.infos()
@@ -420,9 +413,8 @@ def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
 def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
                               group_id: Optional[str], auto_waitlist: bool) -> Dict[str, Any]:
     """
-    Findet die LV-Zeile (lv_id), wählt das zugehörige Formular und submitted.
-    Versucht optional group_id / Warteliste zu setzen.
-    Erkennt 'Anmeldung nicht möglich' vorab und 'Bestätigen'-Zwischenseite.
+    Find LV row (lv_id), pick its form and submit.
+    Handles pre-closed status and 2-step confirm pages.
     """
     lv_table = soup_lv.find("table", {"class": "b3k-data"})
     lv_body = lv_table.find("tbody") if lv_table else None
@@ -439,7 +431,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
         if cur_lv != str(lv_id):
             continue
 
-        # Status in der Zeile (z. B. "Anmeldung nicht möglich")
+        # pre status (e.g. "Anmeldung nicht möglich")
         status_div = row.select_one("td.box div")
         pre_status_txt = (status_div.get_text(" ", strip=True) if status_div else "").strip().lower()
 
@@ -451,11 +443,11 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
     if not target_form_name:
         raise HTTPException(status_code=404, detail=f"LV {lv_id} not found or no enroll form present.")
 
-    # Vorab: klarer "closed"-Status ohne Submit
+    # short-circuit: closed
     if any(k in pre_status_txt for k in ["nicht möglich", "gesperrt", "geschlossen"]):
         return {"result": "closed", "message": "Anmeldung derzeit nicht möglich (laut LV-Status)."}
 
-    # entsprechendes Formular auswählen
+    # pick the matching form
     try:
         client.browser.select_form(target_form_name)
     except Exception:
@@ -468,7 +460,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
         if not matched:
             raise HTTPException(status_code=502, detail="Enroll form not selectable in mechanize context.")
 
-    # Gruppe setzen (best-effort)
+    # optional group
     if group_id:
         for possible in ["GRUPPE", "group", "GROUP", "grp", "gruppe", "GRP_ID", "GRUPPE_ID"]:
             try:
@@ -483,11 +475,10 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
             except Exception:
                 continue
 
-    # Warteliste, wenn aktiv
+    # optional waitlist selection
     if auto_waitlist:
         for ctrl in getattr(client.browser.form, "controls", []):
             try:
-                # Select/Radio-Items mit Label "Warteliste"
                 if hasattr(ctrl, "items") and ctrl.items:
                     for item in ctrl.items:
                         try:
@@ -500,27 +491,23 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
                                 item.selected = True
                         except Exception:
                             continue
-                # Fallback value-Heuristik
                 val = getattr(ctrl, "value", None)
                 if isinstance(val, str) and "wart" in val.lower():
                     ctrl.value = val
             except Exception:
                 continue
 
-    # 1. Submit
+    # first submit
     r3 = client.browser.submit()
     soup3 = BeautifulSoup(r3.read(), "html.parser")
     page_text = soup3.get_text(" ", strip=True).lower()
 
-    # Erkennen einer Bestätigungsseite (zweiter Schritt)
-    confirm_needed = any(k in page_text for k in [
-        "bestätigen", "bestaetigen", "überprüfen", "ueberpruefen"
-    ]) and not any(k in page_text for k in [
-        "erfolgreich", "warteliste", "bereits angemeldet"
-    ])
+    # detect confirm step
+    confirm_needed = any(k in page_text for k in ["bestätigen", "bestaetigen", "überprüfen", "ueberpruefen"]) and not any(
+        k in page_text for k in ["erfolgreich", "warteliste", "bereits angemeldet"]
+    )
 
     if confirm_needed:
-        # Versuche ein Formular auszuwählen, das wie "bestaetigen" / "confirm" aussieht
         picked = False
         try:
             for frm in client.browser.forms():
@@ -533,7 +520,6 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
             pass
 
         if not picked:
-            # Fallback: wähle das erste Formular
             try:
                 client.browser.form = next(iter(client.browser.forms()))
                 picked = True
@@ -548,7 +534,6 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
             except Exception:
                 pass
 
-    # Ergebnis-Detektion
     if any(k in page_text for k in ["erfolgreich angemeldet", "anmeldung erfolgreich", "erfolgreich durchgef"]):
         return {"result": "success", "message": "Anmeldung erfolgreich."}
     if "warteliste" in page_text or "auf die warteliste" in page_text:
@@ -558,8 +543,7 @@ def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
     if any(k in page_text for k in ["nicht möglich", "gesperrt", "geschlossen"]):
         return {"result": "closed", "message": "Anmeldung derzeit nicht möglich."}
 
-    # Diagnose zurückgeben
-    # (kleiner Text-Ausschnitt + Formular-Namen)
+    # unknown
     forms = []
     try:
         forms = [getattr(f, "name", None) for f in client.browser.forms()]
@@ -582,19 +566,22 @@ def root():
 def healthz():
     return {"ok": True}
 
-# ------ SEARCH (mit Cache & Provisional) ------
+# ------ SEARCH (cache + provisional + relaxed fallback) ------
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
-    Ultra-fast auf warmem Cache. Bei kaltem Cache: Provisional Scan (~900ms),
-    damit die UI nicht leer bleibt.
+    Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
+    - run a ~1s provisional scan and always report it in meta,
+    - then try a relaxed OR-match as a fallback for very short queries.
     """
     try:
         _ensure_index(p.username, p.password, force=False)
 
         with _CACHE_LOCK:
-            entry = _CACHE.get(p.username) or {"items": [], "updated": 0.0, "building": False,
-                                               "last_error": None, "build_started": None, "build_finished": None}
+            entry = _CACHE.get(p.username) or {
+                "items": [], "updated": 0.0, "building": False,
+                "last_error": None, "build_started": None, "build_finished": None
+            }
             items_snapshot = list(entry.get("items", []))
             updated = entry.get("updated", 0.0)
             building = bool(entry.get("building"))
@@ -603,6 +590,7 @@ def courses_search(p: SearchIn):
         tokens = [_norm(t) for t in (p.q or "").split() if t]
         cap = int(p.limit) if (isinstance(p.limit, int) and p.limit and p.limit > 0) else None
 
+        # Pass 1: strict AND-match on cache
         out: List[Dict[str, Any]] = []
         for it in items_snapshot:
             if _matches(tokens, it.get("title") or "", " ".join(it.get("lecturers") or []), it.get("lv") or ""):
@@ -610,15 +598,34 @@ def courses_search(p: SearchIn):
                 if cap and len(out) >= cap:
                     break
 
+        # Provisional scan if nothing found and user provided tokens
         provisional_used = False
+        prov_error = None
         if (not out) and tokens:
+            provisional_used = True
             try:
                 prov = _provisional_scan(p.username, p.password, p.q, p.limit, timeout_ms=PROVISIONAL_TIMEOUT_MS)
                 if prov:
                     out = prov[: (cap or len(prov))]
-                    provisional_used = True
-            except Exception:
-                pass
+            except Exception as e:
+                prov_error = str(e)
+
+        # Pass 2: relaxed OR-match on cache if still empty
+        if (not out) and tokens and items_snapshot:
+            relaxed: List[Dict[str, Any]] = []
+            for it in items_snapshot:
+                hay = " ".join(filter(None, [
+                    it.get("title") or "",
+                    " ".join(it.get("lecturers") or []),
+                    str(it.get("lv") or "")
+                ]))
+                hay_n = _norm(hay)
+                if any(t in hay_n for t in tokens):   # OR instead of AND
+                    relaxed.append(it)
+                    if cap and len(relaxed) >= cap:
+                        break
+            if relaxed:
+                out = relaxed
 
         return {
             "ok": True,
@@ -628,8 +635,8 @@ def courses_search(p: SearchIn):
                 "updated_at_unix": updated,
                 "building": building,
                 "fresh": (_now() - updated) < INDEX_TTL_SECONDS if updated else False,
-                "provisional": provisional_used,
-                "last_error": last_error,
+                "provisional": provisional_used,     # true even if provisional found nothing
+                "last_error": prov_error or last_error,
             }
         }
 
@@ -641,7 +648,7 @@ def courses_search(p: SearchIn):
 
 @app.post("/courses/reindex")
 def courses_reindex(p: ReindexIn):
-    """Startet einen Hintergrund-Reindex für diesen Account."""
+    """Start a background reindex for this account."""
     try:
         _ensure_index(p.username, p.password, force=True)
         return {"ok": True, "queued": True}
@@ -732,7 +739,7 @@ def debug_forms(p: SearchIn):
 @app.post("/enroll")
 def enroll(p: EnrollIn):
     """
-    Führt eine Anmeldung für die gegebene PP/LV durch.
+    Perform an enrollment for the given PP/LV.
     """
     if not p.username or not p.password or not p.pp or not p.lv:
         raise HTTPException(status_code=400, detail="Missing credentials or pp/lv.")
