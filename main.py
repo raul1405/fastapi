@@ -1,8 +1,7 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
-
-from lpislib import WuLpisApi  # <- vendored client
 
 app = FastAPI()
 
@@ -49,20 +48,23 @@ def extract_items(result: Dict[str, Any], q: str, limit: Optional[int]) -> List[
                 return items
     return items
 
+def get_lpis_client(user: str, pw: str):
+    # Lazy import – avoids startup crash if deps are missing
+    try:
+        from lpislib import WuLpisApi
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LPIS client not available: {e}")
+    try:
+        return WuLpisApi(user, pw, args=None, sessiondir=None)
+    except Exception as e:
+        # bubble up login/parse errors
+        raise HTTPException(status_code=502, detail=str(e))
+
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
-    try:
-        if not p.username or not p.password:
-            raise HTTPException(status_code=400, detail="Missing credentials")
-
-        client = WuLpisApi(p.username, p.password, args=None, sessiondir=None)
-        res = client.infos()
-        if hasattr(client, "getResults"):
-            res = client.getResults()
-
-        items = extract_items(res, p.q, p.limit)
-        return {"ok": True, "items": items}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    client = get_lpis_client(p.username, p.password)
+    res = client.infos()
+    if hasattr(client, "getResults"):
+        res = client.getResults()
+    items = extract_items(res, p.q, p.limit)
+    return {"ok": True, "items": items}
