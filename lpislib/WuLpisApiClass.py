@@ -1,296 +1,465 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import requests, dill, sys, base64, datetime, re, os, time, hashlib, pickle, unicodedata
-from lxml import html
+import sys
+import os
+import re
+import time
+import base64
+import dill  # if unused, you can remove
+import pickle
+import hashlib
+import datetime
+import threading
 from datetime import timedelta
 from dateutil import parser
+from typing import Any, Dict
+
+import requests  # if unused, you can remove
+from lxml import html
 from bs4 import BeautifulSoup
-
-import mechanize, threading, time
-
-class WuLpisApi():
-
-	URL = "https://lpis.wu.ac.at/lpis"
-
-	def __init__(self, username=None, password=None, args=None, sessiondir=None):
-		self.username = username
-		self.password = password
-		self.matr_nr = username[1:]
-		self.args = args
-		self.data = {}
-		self.status = {}
-		self.browser = mechanize.Browser()
-
-		if sessiondir:
-			self.sessionfile = sessiondir + username
-		else:
-			self.sessionfile = "sessions/" + username
-
-		self.browser.set_handle_robots(False)   # ignore robots
-		self.browser.set_handle_refresh(False)  # can sometimes hang without this
-		self.browser.set_handle_equiv(True)
-		self.browser.set_handle_redirect(True)
-		self.browser.set_handle_referer(True)
-		self.browser.set_debug_http(False)
-		self.browser.set_debug_responses(False)
-		self.browser.set_debug_redirects(True)
-		self.browser.addheaders = [
-			('User-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'),
-			('Accept', '*/*')
-		]
-		self.login()
-
-	def login(self):
-		# print "init time: %s" % datetime.datetime.now()
-		self.data = {}
-
-		#if not self.load_session():
-		# print "logging in ..."
-
-		r = self.browser.open(self.URL)
-		self.browser.select_form('login')
-
-		tree = html.fromstring(re.sub(r"<!--(.|\s|\n)*?-->", "", r.read())) # removes comments from html 
-		input_username = list(set(tree.xpath("//input[@accesskey='u']/@name")))[0]
-		input_password = list(set(tree.xpath("//input[@accesskey='p']/@name")))[0]
-
-		self.browser[input_username] = self.username
-		self.browser[input_password] = self.password
-		r = self.browser.submit()
-
-		# get scraped LPIS url 
-		# looks like: https://lpis.wu.ac.at/kdcs/bach-s##/#####/
-		url = r.geturl()
-		self.URL_scraped = url[:url.rindex('/')+1]
-
-		self.data = self.URL_scraped
-		#self.save_session()
-
-		return self.data
+import mechanize
 
 
-	def getResults(self):
-		status = self.status
-		if "last_logged_in" in status:
-			status["last_logged_in"] = self.status["last_logged_in"].strftime("%Y-%m-%d %H:%M:%S")
-		return {
-			"data" : self.data, 
-			"status" : self.status
-		}
+class WuLpisApi:
+    URL = "https://lpis.wu.ac.at/lpis"
 
+    def __init__(self, username=None, password=None, args=None, sessiondir=None):
+        self.username = username or ""
+        self.password = password or ""
+        # expects usernames like h12345678; matr_nr is the part after the first char
+        self.matr_nr = self.username[1:] if self.username else ""
+        self.args = args
+        self.data: Dict[str, Any] = {}
+        self.status: Dict[str, Any] = {}
 
-	def save_session(self):
-		# print "trying to save session ..."
-		if not os.path.exists(os.path.dirname(self.sessionfile)):
-			try:
-				os.makedirs(os.path.dirname(self.sessionfile))
-			except:
-				if exc.errno != errno.EEXIST:
-					raise
-		with open(self.sessionfile, 'wb') as file:
-			try:
-				# dill.dump(self.browser, file)	
-				pickle.dump(self.browser, file, pickle.HIGHEST_PROTOCOL)
-			except:
-				return False
-		# print "session saved to file ..."
-		return True
+        self.browser = mechanize.Browser()
+        self.browser.set_handle_robots(False)   # ignore robots
+        self.browser.set_handle_refresh(False)  # can sometimes hang without this
+        self.browser.set_handle_equiv(True)
+        self.browser.set_handle_redirect(True)
+        self.browser.set_handle_referer(True)
+        self.browser.set_debug_http(False)
+        self.browser.set_debug_responses(False)
+        self.browser.set_debug_redirects(False)
+        self.browser.addheaders = [
+            ('User-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'),
+            ('Accept', '*/*')
+        ]
 
+        # sessions/<username> as default (next to the process)
+        if sessiondir:
+            self.sessionfile = os.path.join(sessiondir, self.username)
+        else:
+            self.sessionfile = os.path.join("sessions", self.username)
 
-	def load_session(self):
-		# print "trying to load session ..."
-		if os.path.isfile(self.sessionfile):
-			with open(self.sessionfile, 'rb') as file:
-				try:
-					self.browser = pickle.load(file)
-				except:
-					return False
-			# print "session loaded from file ..."
-			return True
+        self.login()
 
+    # --------------------------- utils ---------------------------
 
-	def infos(self):
-		# print "getting data ..."
-		self.data = {}
-		self.browser.select_form('ea_stupl')
-		
-		form = self.browser.form
-		# Select first element in Select Options Dropdown
-		item = form.find_control("ASPP").get(None ,None, None, 0)
-		item.selected = True
+    @staticmethod
+    def _read_bytes_to_str(resp_bytes: bytes) -> str:
+        # Make sure regex/lxml/bs get text
+        if isinstance(resp_bytes, bytes):
+            return resp_bytes.decode("utf-8", errors="ignore")
+        return str(resp_bytes or "")
 
-		r = self.browser.submit()
-		soup = BeautifulSoup(r.read(), "html.parser")
+    # --------------------------- session ---------------------------
 
-		studies = {}
-		studies = {}
-		for i, entry in enumerate(soup.find('select', {'name': 'ASPP'}).find_all('option')):
-			if len(entry.text.split('/')) == 1:
-				studies[i] = {}
-				studies[i]['id'] = entry['value']
-				studies[i]['title'] = entry['title']
-				studies[i]['name'] = entry.text
-				studies[i]['abschnitte'] = {}
-			elif len(entry.text.split('/')) == 2 and entry.text.split('/')[0] == studies[(i-1) % len(studies)]['name']:
-				studies[(i-1) % len(studies)]['abschnitte'][entry['value']] = {}
-				studies[(i-1) % len(studies)]['abschnitte'][entry['value']]['id'] = entry['value']
-				studies[(i-1) % len(studies)]['abschnitte'][entry['value']]['title'] = entry['title']
-				studies[(i-1) % len(studies)]['abschnitte'][entry['value']]['name'] = entry.text
+    def save_session(self):
+        """Persist the mechanize browser (pickle)."""
+        try:
+            os.makedirs(os.path.dirname(self.sessionfile), exist_ok=True)
+            with open(self.sessionfile, 'wb') as f:
+                pickle.dump(self.browser, f, pickle.HIGHEST_PROTOCOL)
+            return True
+        except Exception as e:
+            print(f"[save_session] failed: {e}")
+            return False
 
-		self.data['studies'] = studies
+    def load_session(self):
+        """Load a previously saved browser session."""
+        try:
+            if os.path.isfile(self.sessionfile):
+                with open(self.sessionfile, 'rb') as f:
+                    self.browser = pickle.load(f)
+                return True
+            return False
+        except Exception as e:
+            print(f"[load_session] failed: {e}")
+            return False
 
-		pp = {}
-		for i, planpunkt in enumerate(soup.find('table', {"class" : "b3k-data"}).find('tbody').find_all('tr')):
-			# if planpunkt.find('a', title='Lehrveranstaltungsanmeldung'):
-			if planpunkt.select('td:nth-of-type(2)')[0].text:
-				key = planpunkt.a['id'][1:]
-				pp[key] = {}
-				pp[key]["order"] = i + 1
-				pp[key]["depth"] = int(re.findall('\\d+', planpunkt.select('td:nth-of-type(1)')[0]['style'])[0]) / 16
-				pp[key]["id"] = key
-				pp[key]["type"] = planpunkt.select('td:nth-of-type(1) span:nth-of-type(1)')[0].text.strip()
-				pp[key]["name"] = planpunkt.select('td:nth-of-type(1) span:nth-of-type(2)')[0].text.strip()
-				
-				if planpunkt.select('a[href*="DLVO"]'):
-					pp[key]["lv_url"] = planpunkt.select('a[href*="DLVO"]')[0]['href']
-					pp[key]["lv_status"] = planpunkt.select('a[href*="DLVO"]')[0].text.strip()
-				if planpunkt.select('a[href*="GP"]'):
-					pp[key]["prf_url"] = planpunkt.select('a[href*="GP"]')[0]['href']
+    # --------------------------- login ---------------------------
 
-				if '/' in planpunkt.select('td:nth-of-type(2)')[0].text:
-					pp[key]["attempts"] = planpunkt.select('td:nth-of-type(2) span:nth-of-type(1)')[0].text.strip()
-					pp[key]["attempts_max"] = planpunkt.select('td:nth-of-type(2) span:nth-of-type(2)')[0].text.strip()
+    def login(self):
+        # print(f"init time: {datetime.datetime.now()}")
+        self.data = {}
 
-				if planpunkt.select('td:nth-of-type(3)')[0].text.strip():
-					pp[key]["result"] = planpunkt.select('td:nth-of-type(3)')[0].text.strip()
-				if planpunkt.select('td:nth-of-type(4)')[0].text.strip():
-					pp[key]["date"] = planpunkt.select('td:nth-of-type(4)')[0].text.strip()
+        # open login page
+        r = self.browser.open(self.URL)
+        # LPIS uses comments in markup – strip to simplify xpath
+        html_text = self._read_bytes_to_str(r.read())
+        html_text = re.sub(r"<!--(.|\s|\n)*?-->", "", html_text)
+        tree = html.fromstring(html_text)
 
-				if 'lv_url' in pp[key]:
-					r = self.browser.open(self.URL_scraped + pp[key]["lv_url"])
-					soup = BeautifulSoup(r.read(), "html.parser")
-					pp[key]['lvs'] = {}
+        # form 'login' expected
+        try:
+            self.browser.select_form('login')
+        except mechanize.FormNotFoundError:
+            # try fallback: pick the first form
+            forms = list(self.browser.forms())
+            if not forms:
+                raise RuntimeError("Login form not found on LPIS landing page.")
+            self.browser.form = forms[0]
 
-					if soup.find('table', {"class" : "b3k-data"}):
-						for lv in soup.find('table', {"class" : "b3k-data"}).find('tbody').find_all('tr'):
-							number = lv.select('.ver_id a')[0].text.strip()
-							pp[key]['lvs'][number] = {}
-							pp[key]['lvs'][number]['id'] = number
-							pp[key]['lvs'][number]['semester'] = lv.select('.ver_id span')[0].text.strip()
-							pp[key]['lvs'][number]['prof'] = lv.select('.ver_title div')[0].text.strip()
-							pp[key]['lvs'][number]['name'] = lv.find('td', {"class" : "ver_title"}).findAll(text=True, recursive=False)[1].strip()
-							pp[key]['lvs'][number]['status'] = lv.select('td.box div')[0].text.strip()
-							capacity = lv.select('div[class*="capacity_entry"]')[0].text.strip()
-							pp[key]['lvs'][number]['free'] = capacity[:capacity.rindex('/')-1]
-							pp[key]['lvs'][number]['capacity'] = capacity[capacity.rindex('/')+2:]
-							
-							if lv.select('td.action form'):
-								internal_id = lv.select('td.action form')[0]['name']
-								pp[key]['lvs'][number]['internal_id'] = internal_id.rsplit('_')[1]
-							date = lv.select('td.action .timestamp span')[0].text.strip()
-							
-							if 'ab' in date:
-								pp[key]['lvs'][number]['date_start'] = date[3:]
-							if 'bis' in date:
-								pp[key]['lvs'][number]['date_end'] = date[4:]
+        # find username/password input names by accesskey (as in legacy code)
+        usernames = list(set(tree.xpath("//input[@accesskey='u']/@name")))
+        passwords = list(set(tree.xpath("//input[@accesskey='p']/@name")))
+        if not usernames or not passwords:
+            raise RuntimeError("Could not locate LPIS username/password fields.")
 
-							if lv.select('td.box.active'):
-								pp[key]['lvs'][number]['registerd_at'] = lv.select('td.box.active .timestamp span')[0].text.strip()
+        input_username = usernames[0]
+        input_password = passwords[0]
 
-							if lv.select('td.capacity div[title*="Anzahl Warteliste"]'):
-								pp[key]['lvs'][number]['waitlist'] = lv.select('td.capacity div[title*="Anzahl Warteliste"]')[0].text.strip()
-							
-		self.data['pp'] = pp				
-		return self.data
+        self.browser[input_username] = self.username
+        self.browser[input_password] = self.password
+        r = self.browser.submit()
 
+        # after login, URL looks like: https://lpis.wu.ac.at/kdcs/bach-s##/#####/
+        url = r.geturl()
+        if "/" not in url:
+            raise RuntimeError("Unexpected LPIS redirect URL after login.")
+        self.URL_scraped = url[:url.rindex('/') + 1]
 
-	def registration(self):
+        self.data = self.URL_scraped
+        # self.save_session()
+        self.status["last_logged_in"] = datetime.datetime.now()
+        return self.data
 
-		self.browser.select_form('ea_stupl')
-		
-		form = self.browser.form
-		# Select first element in Select Options Dropdown
-		item = form.find_control("ASPP").get(None ,None, None, 0)
-		item.selected = True
-		
-		# timeserver = "timeserver.wu.ac.at"
-		# print "syncing time with \"%s\"" % timeserver
-		# os.system('sudo ntpdate -u %s' % timeserver)
-		offset = 1.0	# seconds before start time when the request should be made
-		if self.args.planobject and self.args.course:
-			pp = "S" + self.args.planobject
-			lv = self.args.course
-			lv2 = self.args.course2
-		
-		self.data = {}
-		self.browser.select_form('ea_stupl')
-		r = self.browser.submit()
-		soup = BeautifulSoup(r.read(), "html.parser")
+    def getResults(self):
+        status = dict(self.status)
+        if "last_logged_in" in status and isinstance(status["last_logged_in"], datetime.datetime):
+            status["last_logged_in"] = status["last_logged_in"].strftime("%Y-%m-%d %H:%M:%S")
+        return {
+            "data": self.data,
+            "status": status
+        }
 
-		url = soup.find('table', {"class" : "b3k-data"}).find('a', id=pp).parent.find('a', href=True)["href"]
-		r = self.browser.open(self.URL_scraped + url)
+    # --------------------------- infos (structure) ---------------------------
 
-		triggertime = 0
-		soup = BeautifulSoup(r.read(), "html.parser")
-		date = soup.find('table', {"class" : "b3k-data"}).find('a', text=lv).parent.parent.select('.action .timestamp span')[0].text.strip()
-		if 'ab' in date:
-			triggertime = time.mktime(datetime.datetime.strptime(date[3:], "%d.%m.%Y %H:%M").timetuple()) - offset
-			if triggertime > time.time():
-				print "waiting: %.2f seconds (%.2f minutes)" % ((triggertime - time.time()), (triggertime - time.time()) / 60)
-				print "waiting till: %s (%s)" % (triggertime, time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(triggertime)))
- 				time.sleep( triggertime - time.time() )
+    def infos(self):
+        """Scrape study plan points (pp) and course list (lvs) per pp."""
+        # print("getting data ...")
+        self.data = {}
 
- 		print "triggertime: %s" % triggertime
-		print "final open time start: %s" % datetime.datetime.now()
-		
-		# Reload page until registration is possible
-		while True:
-			print "start request %s" % datetime.datetime.now()
-			r = self.browser.open(self.URL_scraped + url)
-			soup = BeautifulSoup(r.read(), "html.parser")
+        # select form for study plan overview
+        try:
+            self.browser.select_form('ea_stupl')
+        except mechanize.FormNotFoundError:
+            # try to navigate to start page again
+            self.browser.open(self.URL_scraped)
+            self.browser.select_form('ea_stupl')
 
-			if soup.find('table', {"class" : "b3k-data"}).find('a', text=lv).parent.parent.select('div.box.possible'):
-				break
-			else:
-				print "parsing done %s" % datetime.datetime.now()
-			print "registration is not (yet) possibe, waiting ..."
-			print "reloading page and waiting for form to be submittable"
+        form = self.browser.form
+        # Select first element in Select Options Dropdown: ASPP
+        try:
+            item = form.find_control("ASPP").get(None, None, None, 0)
+            item.selected = True
+        except Exception:
+            pass  # if not present, continue
 
-		print "final open time end: %s" % datetime.datetime.now()
-		print "registration is possible"
+        r = self.browser.submit()
+        soup = BeautifulSoup(r.read(), "html.parser")
 
+        # -------- studies (ASPP options) ----------
+        studies = {}
+        select = soup.find('select', {'name': 'ASPP'})
+        if select:
+            all_opts = select.find_all('option')
+            for i, entry in enumerate(all_opts):
+                text = entry.text or ""
+                parts = text.split('/')
+                if len(parts) == 1:
+                    studies[i] = {
+                        'id': entry.get('value', ''),
+                        'title': entry.get('title', ''),
+                        'name': text,
+                        'abschnitte': {}
+                    }
+                elif len(parts) == 2 and (i - 1) % max(len(studies), 1) in studies:
+                    parent_idx = (i - 1) % max(len(studies), 1)
+                    abschn = studies.get(parent_idx, {}).setdefault('abschnitte', {})
+                    abschn[entry.get('value', '')] = {
+                        'id': entry.get('value', ''),
+                        'title': entry.get('title', ''),
+                        'name': text
+                    }
+        self.data['studies'] = studies
 
-		cap1 = soup.find('table', {"class" : "b3k-data"}).find('a', text=lv).parent.parent.select('div[class*="capacity_entry"]')[0].text.strip()
-		cap2 = soup.find('table', {"class" : "b3k-data"}).find('a', text=lv2).parent.parent.select('div[class*="capacity_entry"]')[0].text.strip()
-		free1 = int(cap1[:cap1.rindex('/')-1])
-		free2 = int(cap2[:cap2.rindex('/')-1])
+        # -------- planpunkte / lvs ----------
+        pp = {}
+        table = soup.find('table', {"class": "b3k-data"})
+        tbody = table.find('tbody') if table else None
+        rows = tbody.find_all('tr') if tbody else []
 
-		form1 = soup.find('table', {"class" : "b3k-data"}).find('a', text=lv).parent.parent.select('.action form')[0]["name"].strip()
-		form2 = soup.find('table', {"class" : "b3k-data"}).find('a', text=lv2).parent.parent.select('.action form')[0]["name"].strip()
+        for i, planpunkt in enumerate(rows):
+            # second td has text → valid row
+            second_td = planpunkt.select_one('td:nth-of-type(2)')
+            if not (second_td and (second_td.text or "").strip()):
+                continue
 
-		print "end time: %s" % datetime.datetime.now()
-		print "freie plaetze: lv1: %s, lv2: %s (if defined)" % (free1, free2)
-		if free1 > 0:
-			self.browser.select_form(form1)
-			print "submitting registration form1 (%s)" % form1
-		else:
-			self.browser.select_form(form2)
-			print "submitting registration form2 (%s)" % form2
+            a_tag = planpunkt.find('a')
+            if not (a_tag and a_tag.get('id')):
+                continue
 
-		r = self.browser.submit()
+            key = a_tag['id'][1:]  # drop leading char (e.g. 'S12345' -> '12345')
+            pp[key] = {}
+            pp[key]["order"] = i + 1
 
-		soup = BeautifulSoup(r.read(), "html.parser")
-		if soup.find('div', {"class" : 'b3k_alert_content'}):
-			print soup.find('div', {"class" : 'b3k_alert_content'}).text.strip()
-			lv = soup.find('table', {"class" : "b3k-data"}).find('a', text=lv).parent.parent
-			print "Frei: " + lv.select('div[class*="capacity_entry"]')[0].text.strip()
-			if lv.select('td.capacity div[title*="Anzahl Warteliste"]'):
-				print "Warteliste: " + lv.select('td.capacity div[title*="Anzahl Warteliste"] span')[0].text.strip() + " / " + lv.select('td.capacity div[title*="Anzahl Warteliste"] span')[0].text.strip()
-				if free1 > 0:
-					self.browser.select_form(form2)
-					print "submitting registration form (%s)" % form
-					r = self.browser.submit()
+            style_td = planpunkt.select_one('td:nth-of-type(1)')
+            style_attr = style_td.get('style', '') if style_td else ''
+            depth_nums = re.findall(r'\d+', style_attr)
+            try:
+                pp[key]["depth"] = int(depth_nums[0]) // 16
+            except Exception:
+                pp[key]["depth"] = 0
 
-		if soup.find('h3'):
-			print soup.find('h3').find('span').text.strip()
+            pp[key]["id"] = key
+
+            # type + name
+            span1 = planpunkt.select_one('td:nth-of-type(1) span:nth-of-type(1)')
+            span2 = planpunkt.select_one('td:nth-of-type(1) span:nth-of-type(2)')
+            pp[key]["type"] = (span1.text if span1 else "").strip()
+            pp[key]["name"] = (span2.text if span2 else "").strip()
+
+            # lv/prf urls & status
+            link_lv = planpunkt.select_one('a[href*="DLVO"]')
+            link_gp = planpunkt.select_one('a[href*="GP"]')
+            if link_lv:
+                pp[key]["lv_url"] = link_lv.get('href', '')
+                pp[key]["lv_status"] = (link_lv.text or "").strip()
+            if link_gp:
+                pp[key]["prf_url"] = link_gp.get('href', '')
+
+            # attempts (like '1/3')
+            txt2 = (second_td.text or "").strip()
+            if '/' in txt2:
+                spans = planpunkt.select('td:nth-of-type(2) span')
+                if len(spans) >= 2:
+                    pp[key]["attempts"] = (spans[0].text or "").strip()
+                    pp[key]["attempts_max"] = (spans[1].text or "").strip()
+
+            # result/date
+            td3 = planpunkt.select_one('td:nth-of-type(3)')
+            td4 = planpunkt.select_one('td:nth-of-type(4)')
+            if td3 and td3.text.strip():
+                pp[key]["result"] = td3.text.strip()
+            if td4 and td4.text.strip():
+                pp[key]["date"] = td4.text.strip()
+
+            # load LV list if available
+            if "lv_url" in pp[key]:
+                r2 = self.browser.open(self.URL_scraped + pp[key]["lv_url"])
+                soup2 = BeautifulSoup(r2.read(), "html.parser")
+                pp[key]['lvs'] = {}
+
+                lv_table = soup2.find('table', {"class": "b3k-data"})
+                lv_body = lv_table.find('tbody') if lv_table else None
+                if lv_body:
+                    for lv in lv_body.find_all('tr'):
+                        ver_id_link = lv.select_one('.ver_id a')
+                        if not ver_id_link:
+                            continue
+                        number = (ver_id_link.text or "").strip()
+                        if not number:
+                            continue
+
+                        pp[key]['lvs'][number] = {}
+                        cur = pp[key]['lvs'][number]
+                        cur['id'] = number
+
+                        sem_span = lv.select_one('.ver_id span')
+                        cur['semester'] = (sem_span.text or "").strip() if sem_span else None
+
+                        prof_div = lv.select_one('.ver_title div')
+                        cur['prof'] = (prof_div.text or "").strip() if prof_div else ""
+
+                        name_td = lv.find('td', {"class": "ver_title"})
+                        if name_td:
+                            # text nodes not inside children
+                            name_texts = [t for t in name_td.find_all(text=True, recursive=False)]
+                            cur['name'] = (name_texts[1] if len(name_texts) > 1 else name_texts[0] if name_texts else "").strip()
+                        else:
+                            cur['name'] = ""
+
+                        status_div = lv.select_one('td.box div')
+                        cur['status'] = (status_div.text or "").strip() if status_div else None
+
+                        cap_div = lv.select_one('div[class*="capacity_entry"]')
+                        cap_txt = (cap_div.text or "").strip() if cap_div else ""
+                        # format "x / y" → parse defensively
+                        try:
+                            slash = cap_txt.rindex('/')
+                            free = cap_txt[:slash].strip()
+                            cap = cap_txt[slash + 1:].strip()
+                            cur['free'] = int(re.sub(r'[^\d]', '', free)) if free else None
+                            cur['capacity'] = int(re.sub(r'[^\d]', '', cap)) if cap else None
+                        except Exception:
+                            cur['free'] = None
+                            cur['capacity'] = None
+
+                        # internal id from form name
+                        form = lv.select_one('td.action form')
+                        if form and form.get('name'):
+                            internal_id = form['name']
+                            if '_' in internal_id:
+                                cur['internal_id'] = internal_id.rsplit('_', 1)[-1]
+
+                        # registration time window
+                        ts_span = lv.select_one('td.action .timestamp span')
+                        date_txt = (ts_span.text or "").strip() if ts_span else ""
+                        if date_txt.startswith('ab '):
+                            cur['date_start'] = date_txt[3:].strip()
+                        if date_txt.startswith('bis '):
+                            cur['date_end'] = date_txt[4:].strip()
+
+                        # already registered?
+                        reg_box = lv.select_one('td.box.active .timestamp span')
+                        if reg_box and reg_box.text:
+                            cur['registered_at'] = reg_box.text.strip()
+
+                        # waitlist present?
+                        wl_div = lv.select_one('td.capacity div[title*="Anzahl Warteliste"]')
+                        if wl_div:
+                            span = wl_div.find('span')
+                            cur['waitlist'] = (span.text or "").strip() if span else (wl_div.text or "").strip()
+
+        self.data['pp'] = pp
+        return self.data
+
+    # --------------------------- registration (legacy) ---------------------------
+
+    def registration(self):
+        """Legacy interactive registration logic (kept mostly as-is, Py3 prints)."""
+        try:
+            self.browser.select_form('ea_stupl')
+        except mechanize.FormNotFoundError:
+            self.browser.open(self.URL_scraped)
+            self.browser.select_form('ea_stupl')
+
+        form = self.browser.form
+        try:
+            item = form.find_control("ASPP").get(None, None, None, 0)
+            item.selected = True
+        except Exception:
+            pass
+
+        # offset before trigger time
+        offset = 1.0  # seconds
+        if self.args and getattr(self.args, "planobject", None) and getattr(self.args, "course", None):
+            pp = "S" + self.args.planobject
+            lv = self.args.course
+            lv2 = getattr(self.args, "course2", None)
+        else:
+            raise RuntimeError("registration() requires args.planobject and args.course")
+
+        self.data = {}
+        self.browser.select_form('ea_stupl')
+        r = self.browser.submit()
+        soup = BeautifulSoup(r.read(), "html.parser")
+
+        # open LV list page for the plan point
+        link = soup.find('table', {"class": "b3k-data"}).find('a', id=pp)
+        if not link:
+            raise RuntimeError("Planpunkt link not found.")
+        url = link.parent.find('a', href=True)["href"]
+        r = self.browser.open(self.URL_scraped + url)
+
+        triggertime = 0
+        soup = BeautifulSoup(r.read(), "html.parser")
+        ts_span = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select_one('.action .timestamp span')
+        date_txt = ts_span.text.strip() if ts_span and ts_span.text else ""
+        if date_txt.startswith('ab '):
+            triggetime = time.mktime(datetime.datetime.strptime(date_txt[3:], "%d.%m.%Y %H:%M").timetuple()) - offset
+            if triggertime > time.time():
+                secs = triggertime - time.time()
+                print(f"waiting: {secs:.2f} seconds ({secs/60:.2f} minutes)")
+                print(f"waiting till: {triggertime} ({time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(triggertime))})")
+                time.sleep(secs)
+
+        print(f"triggertime: {triggertime}")
+        print(f"final open time start: {datetime.datetime.now()}")
+
+        # Reload page until registration is possible
+        while True:
+            print(f"start request {datetime.datetime.now()}")
+            r = self.browser.open(self.URL_scraped + url)
+            soup = BeautifulSoup(r.read(), "html.parser")
+
+            possible = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select('div.box.possible')
+            if possible:
+                break
+            else:
+                print(f"parsing done {datetime.datetime.now()}")
+            print("registration is not (yet) possible, waiting ...")
+            print("reloading page and waiting for form to be submittable")
+
+        print(f"final open time end: {datetime.datetime.now()}")
+        print("registration is possible")
+
+        cap1_div = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select('div[class*="capacity_entry"]')
+        cap2_div = soup.find('table', {"class": "b3k-data"}).find('a', text=lv2).parent.parent.select('div[class*="capacity_entry"]') if lv2 else None
+        cap1 = cap1_div[0].text.strip() if cap1_div else "0 / 0"
+        cap2 = cap2_div[0].text.strip() if cap2_div else "0 / 0"
+
+        def _parse_free(s):
+            try:
+                slash = s.rindex('/')
+                return int(re.sub(r'[^\d]', '', s[:slash]))
+            except Exception:
+                return 0
+
+        free1 = _parse_free(cap1)
+        free2 = _parse_free(cap2) if lv2 else 0
+
+        form1 = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select_one('.action form')
+        form2 = soup.find('table', {"class": "b3k-data"}).find('a', text=lv2).parent.parent.select_one('.action form') if lv2 else None
+
+        name1 = form1["name"].strip() if form1 and form1.get("name") else None
+        name2 = form2["name"].strip() if form2 and form2.get("name") else None
+
+        print(f"end time: {datetime.datetime.now()}")
+        print(f"freie plaetze: lv1: {free1}, lv2: {free2} (if defined)")
+
+        if name1 is None and name2 is None:
+            raise RuntimeError("No registration forms found.")
+
+        if free1 > 0 and name1:
+            self.browser.select_form(name1)
+            print(f"submitting registration form1 ({name1})")
+        elif name2:
+            self.browser.select_form(name2)
+            print(f"submitting registration form2 ({name2})")
+
+        r = self.browser.submit()
+        soup = BeautifulSoup(r.read(), "html.parser")
+        alert = soup.find('div', {"class": 'b3k_alert_content'})
+        if alert:
+            print(alert.text.strip())
+            lv_row = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent
+            cap_txt = lv_row.select_one('div[class*="capacity_entry"]')
+            if cap_txt:
+                print("Frei: " + cap_txt.text.strip())
+            wl = lv_row.select_one('td.capacity div[title*="Anzahl Warteliste"] span')
+            if wl:
+                wltxt = wl.text.strip()
+                print(f"Warteliste: {wltxt} / {wltxt}")
+                if free1 > 0 and name2:
+                    self.browser.select_form(name2)
+                    print(f"submitting registration form ({name2})")
+                    r = self.browser.submit()
+
+        h3 = soup.find('h3')
+        if h3 and h3.find('span'):
+            print(h3.find('span').text.strip())
