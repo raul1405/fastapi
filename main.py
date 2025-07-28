@@ -10,6 +10,7 @@ import threading
 import socket
 import re
 import time
+import os  # NEW: for /whoami
 
 # Hard timeouts so requests can't hang forever
 socket.setdefaulttimeout(8)
@@ -355,7 +356,6 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
         a_tag = planpunkt.find("a")
         if not (a_tag and a_tag.get("id")):
             continue
-        pp_id = a_tag["id"][1:]
         pp_id = a_tag["id"][1:]  # 'S12345' -> '12345'
 
         link_lv = planpunkt.select_one('a[href*="DLVO"]')
@@ -404,7 +404,6 @@ def _provisional_scan(username: str, password: str, q: str, limit: Optional[int]
     if not out and tokens and ((_now() - start) * 1000) <= timeout_ms:
         # Re-scan top few candidates quickly with OR filter by letting tokens=[] in fast parse,
         # then OR-filter here in Python.
-        budget_left_ms = max(0, timeout_ms - int((_now() - start) * 1000))
         top = candidates[: min(5, len(candidates))]  # small subset
         for priority, pp_id, lv_url_rel in top:
             if (_now() - start) * 1000 > timeout_ms:
@@ -657,14 +656,20 @@ def root():
 def healthz():
     return {"ok": True}
 
-# ------ SEARCH (cache + provisional + relaxed fallback) ------
+# NEW: simple process identity endpoint to diagnose split cache / multiple replicas
+@app.get("/whoami")
+def whoami():
+    return {"pid": os.getpid(), "time": time.time()}
+
+# ------ SEARCH (cache + provisional + relaxed + direct fallback) ------
 @app.post("/courses/search")
 def courses_search(p: SearchIn):
     """
     Ultra-fast on warm cache. If cache is cold or strict filter yields nothing:
     - run ~2s provisional scan,
     - then try a relaxed OR-match on cache,
-    - finally a broad provisional scan and OR-filter (final fallback).
+    - finally a broad provisional scan and OR-filter (final fallback),
+    - and if still empty, DO A DIRECT infos() FETCH (pre-enroll behavior) to guarantee results.
     """
     try:
         _ensure_index(p.username, p.password, force=False)
@@ -741,6 +746,62 @@ def courses_search(p: SearchIn):
                         out = filtered
             except Exception as e:
                 prov_error = prov_error or str(e)
+
+        # NEW: Pass 4 — DIRECT infos() fallback to guarantee results (pre-enroll behavior)
+        if not out:
+            try:
+                client = get_lpis_client(p.username, p.password)
+                # Prefer infos(); fallback to getResults()
+                if hasattr(client, "infos"):
+                    res = client.infos()
+                elif hasattr(client, "getResults"):
+                    res = client.getResults()
+                else:
+                    raise HTTPException(status_code=500, detail="LPIS client missing both infos() and getResults()")
+                # same normalization as before
+                data = (res or {}).get("data") or res or {}
+                pp_map = data.get("pp") or {}
+                q_lower = (p.q or "").strip().lower()
+                direct: List[Dict[str, Any]] = []
+                for pp_id, pp_obj in pp_map.items():
+                    lvs = (pp_obj or {}).get("lvs") or {}
+                    for lv_id, lv in lvs.items():
+                        title = (lv or {}).get("name") or ""
+                        prof = (lv or {}).get("prof") or ""
+                        hay = f"{title} {prof}".lower()
+                        if q_lower and q_lower not in hay:
+                            continue
+                        direct.append({
+                            "pp": str(pp_id),
+                            "lv": str(lv_id),
+                            "title": title,
+                            "lecturers": [p.strip() for p in prof.split("·")] if prof else [],
+                            "semester": lv.get("semester"),
+                            "status": lv.get("status"),
+                            "capacity": lv.get("capacity"),
+                            "free": lv.get("free"),
+                            "waitlist": lv.get("waitlist"),
+                        })
+                        if cap and len(direct) >= cap:
+                            break
+                    if cap and len(direct) >= cap:
+                        break
+                if direct:
+                    return {
+                        "ok": True,
+                        "items": direct,
+                        "meta": {
+                            "cached": bool(items_snapshot),
+                            "updated_at_unix": updated,
+                            "building": building,
+                            "fresh": (_now() - updated) < INDEX_TTL_SECONDS if updated else False,
+                            "provisional": True,   # indicates fallback was used
+                            "last_error": prov_error or last_error,
+                        }
+                    }
+            except Exception:
+                # swallow fallback errors; fall through to return whatever we have (possibly empty)
+                pass
 
         return {
             "ok": True,
