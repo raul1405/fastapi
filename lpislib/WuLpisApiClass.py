@@ -14,7 +14,7 @@ from datetime import timedelta
 from dateutil import parser
 from typing import Any, Dict
 
-import requests  # if unused, you can remove
+import requests  # optional
 from lxml import html
 from bs4 import BeautifulSoup
 import mechanize
@@ -91,59 +91,57 @@ class WuLpisApi:
 
     # --------------------------- login ---------------------------
 
-   def login(self):
-    # Reset
-    self.data = {}
+    def login(self):
+        # Reset
+        self.data = {}
 
-    # Open login page
-    r = self.browser.open(self.URL)
+        # Open login page
+        r = self.browser.open(self.URL)
 
-    # Select the login form (fallback to first form if name changed)
-    try:
-        self.browser.select_form('login')
-    except mechanize.FormNotFoundError:
-        forms = list(self.browser.forms())
-        if not forms:
-            raise RuntimeError("Login form not found on LPIS landing page.")
-        self.browser.form = forms[0]
+        # Select the login form (fallback to first form if name changed)
+        try:
+            self.browser.select_form('login')
+        except mechanize.FormNotFoundError:
+            forms = list(self.browser.forms())
+            if not forms:
+                raise RuntimeError("Login form not found on LPIS landing page.")
+            self.browser.form = forms[0]
 
-    # Read raw BYTES and clean comments as BYTES (important for lxml)
-    raw = r.read()  # bytes
-    cleaned = re.sub(rb"<!--.*?-->", b"", raw, flags=re.S)
+        # Read raw BYTES and clean comments as BYTES (important for lxml)
+        raw = r.read()  # bytes
+        cleaned = re.sub(rb"<!--.*?-->", b"", raw, flags=re.S)
 
-    # Parse with lxml FROM BYTES to avoid
-    # 'Unicode strings with encoding declaration...' errors
-    tree = html.fromstring(cleaned)
+        # Parse with lxml FROM BYTES to avoid 'Unicode strings with encoding declaration...' error
+        tree = html.fromstring(cleaned)
 
-    # Find username/password input names by accesskey
-    usernames = list(set(tree.xpath("//input[@accesskey='u']/@name")))
-    passwords = list(set(tree.xpath("//input[@accesskey='p']/@name")))
-    if not usernames or not passwords:
-        raise RuntimeError("Could not locate LPIS username/password fields on login page.")
+        # Find username/password input names by accesskey
+        usernames = list(set(tree.xpath("//input[@accesskey='u']/@name")))
+        passwords = list(set(tree.xpath("//input[@accesskey='p']/@name")))
+        if not usernames or not passwords:
+            raise RuntimeError("Could not locate LPIS username/password fields on login page.")
 
-    input_username = usernames[0]
-    input_password = passwords[0]
+        input_username = usernames[0]
+        input_password = passwords[0]
 
-    # Fill & submit
-    self.browser[input_username] = self.username
-    self.browser[input_password] = self.password
-    r = self.browser.submit()
+        # Fill & submit
+        self.browser[input_username] = self.username
+        self.browser[input_password] = self.password
+        r = self.browser.submit()
 
-    # Extract the base URL after login (e.g., https://lpis.wu.ac.at/kdcs/bach-s##/#####/)
-    url = r.geturl()
-    if "/" not in url:
-        raise RuntimeError("Unexpected LPIS redirect URL after login.")
-    self.URL_scraped = url[:url.rindex('/') + 1]
+        # Extract the base URL after login (e.g., https://lpis.wu.ac.at/kdcs/bach-s##/#####/)
+        url = r.geturl()
+        if "/" not in url:
+            raise RuntimeError("Unexpected LPIS redirect URL after login.")
+        self.URL_scraped = url[:url.rindex('/') + 1]
 
-    self.data = self.URL_scraped
-    self.status["last_logged_in"] = datetime.datetime.now()
-    return self.data
+        self.data = self.URL_scraped
+        self.status["last_logged_in"] = datetime.datetime.now()
+        return self.data
 
     # --------------------------- infos (structure) ---------------------------
 
     def infos(self):
         """Scrape study plan points (pp) and course list (lvs) per pp."""
-        # print("getting data ...")
         self.data = {}
 
         # select form for study plan overview
@@ -227,8 +225,8 @@ class WuLpisApi:
             pp[key]["name"] = (span2.text if span2 else "").strip()
 
             # lv/prf urls & status
-            link_lv = planpunkt.select_one('a[href*="DLVO"]')
-            link_gp = planpunkt.select_one('a[href*="GP"]')
+            link_lv = planpunkt.select_one('a[href*=\"DLVO\"]')
+            link_gp = planpunkt.select_one('a[href*=\"GP\"]')
             if link_lv:
                 pp[key]["lv_url"] = link_lv.get('href', '')
                 pp[key]["lv_status"] = (link_lv.text or "").strip()
@@ -289,7 +287,7 @@ class WuLpisApi:
                         status_div = lv.select_one('td.box div')
                         cur['status'] = (status_div.text or "").strip() if status_div else None
 
-                        cap_div = lv.select_one('div[class*="capacity_entry"]')
+                        cap_div = lv.select_one('div[class*=\"capacity_entry\"]')
                         cap_txt = (cap_div.text or "").strip() if cap_div else ""
                         # format "x / y" → parse defensively
                         try:
@@ -323,7 +321,7 @@ class WuLpisApi:
                             cur['registered_at'] = reg_box.text.strip()
 
                         # waitlist present?
-                        wl_div = lv.select_one('td.capacity div[title*="Anzahl Warteliste"]')
+                        wl_div = lv.select_one('td.capacity div[title*=\"Anzahl Warteliste\"]')
                         if wl_div:
                             span = wl_div.find('span')
                             cur['waitlist'] = (span.text or "").strip() if span else (wl_div.text or "").strip()
@@ -374,7 +372,7 @@ class WuLpisApi:
         ts_span = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select_one('.action .timestamp span')
         date_txt = ts_span.text.strip() if ts_span and ts_span.text else ""
         if date_txt.startswith('ab '):
-            triggetime = time.mktime(datetime.datetime.strptime(date_txt[3:], "%d.%m.%Y %H:%M").timetuple()) - offset
+            triggertime = time.mktime(datetime.datetime.strptime(date_txt[3:], "%d.%m.%Y %H:%M").timetuple()) - offset
             if triggertime > time.time():
                 secs = triggertime - time.time()
                 print(f"waiting: {secs:.2f} seconds ({secs/60:.2f} minutes)")
@@ -401,8 +399,8 @@ class WuLpisApi:
         print(f"final open time end: {datetime.datetime.now()}")
         print("registration is possible")
 
-        cap1_div = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select('div[class*="capacity_entry"]')
-        cap2_div = soup.find('table', {"class": "b3k-data"}).find('a', text=lv2).parent.parent.select('div[class*="capacity_entry"]') if lv2 else None
+        cap1_div = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent.select('div[class*=\"capacity_entry\"]')
+        cap2_div = soup.find('table', {"class": "b3k-data"}).find('a', text=lv2).parent.parent.select('div[class*=\"capacity_entry\"]') if lv2 else None
         cap1 = cap1_div[0].text.strip() if cap1_div else "0 / 0"
         cap2 = cap2_div[0].text.strip() if cap2_div else "0 / 0"
 
@@ -441,10 +439,10 @@ class WuLpisApi:
         if alert:
             print(alert.text.strip())
             lv_row = soup.find('table', {"class": "b3k-data"}).find('a', text=lv).parent.parent
-            cap_txt = lv_row.select_one('div[class*="capacity_entry"]')
+            cap_txt = lv_row.select_one('div[class*=\"capacity_entry\"]')
             if cap_txt:
                 print("Frei: " + cap_txt.text.strip())
-            wl = lv_row.select_one('td.capacity div[title*="Anzahl Warteliste"] span')
+            wl = lv_row.select_one('td.capacity div[title*=\"Anzahl Warteliste\"] span')
             if wl:
                 wltxt = wl.text.strip()
                 print(f"Warteliste: {wltxt} / {wltxt}")
