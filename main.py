@@ -719,12 +719,31 @@ def courses_search(p: SearchIn):
         cap = int(p.limit) if (isinstance(p.limit, int) and p.limit and p.limit > 0) else None
 
         # Pass 1: strict AND-match on cache
+        # Pass 1: substring search (diacritic‑folding + case‑insensitive)
+        import unicodedata
+
+        def norm_sub(s: str) -> str:
+            return (
+                unicodedata
+                .normalize("NFD", s)
+                .encode("ascii", "ignore")
+                .decode("ascii")
+                .lower()
+            )
+
+        qnorm = norm_sub(p.q or "")
         out: List[Dict[str, Any]] = []
-        for it in items_snapshot:
-            if _matches(tokens, it.get("title") or "", " ".join(it.get("lecturers") or []), it.get("lv") or ""):
-                out.append(it)
-                if cap and len(out) >= cap:
-                    break
+        if qnorm:
+            for it in items_snapshot:
+                title_norm = norm_sub(it.get("title", ""))
+                code_norm  = (it.get("pp", "") + it.get("lv", "")).lower()
+                if qnorm in title_norm or qnorm in code_norm:
+                    out.append(it)
+                    if cap and len(out) >= cap:
+                        break
+        else:
+            # empty query → return everything
+            out = items_snapshot
 
         # Provisional scan if nothing found and user provided tokens
         provisional_used = False
