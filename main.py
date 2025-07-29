@@ -11,31 +11,6 @@ import socket
 import contextlib
 import re
 import time
-import requests, threading, time
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-
-# Thread‑safe in‑memory caches
-_SESSION_CACHE: Dict[str, requests.Session] = {}
-_FORM_CACHE: Dict[Tuple[str,str,str], Dict[str,Any]] = {}
-_CACHE_LOCK = threading.Lock()
-
-def get_http_session(username: str) -> requests.Session:
-    with _CACHE_LOCK:
-        if username not in _SESSION_CACHE:
-            sess = requests.Session()
-            # optional: configure retries / keep‑alive here
-            _SESSION_CACHE[username] = sess
-        return _SESSION_CACHE[username]
-
-def cache_enroll_form(username: str, pp: str, lv: str, form_meta: Dict[str,Any]):
-    key = (username, pp, lv)
-    with _CACHE_LOCK:
-        _FORM_CACHE[key] = { **form_meta, "ts": time.time() }
-
-def get_cached_form(username: str, pp: str, lv: str) -> Optional[Dict[str,Any]]:
-    return _FORM_CACHE.get((username,pp,lv))
-
 
 # ---------- Global network defaults ----------
 # Hard default so requests can't hang forever (used outside provisional path)
@@ -209,6 +184,14 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
         wl_div = row.select_one('td.capacity div[title*="Anzahl Warteliste"]')
         if wl_div:
             span = wl_div.find("span")
+            waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
+
+        # ---- matching ----
+        if tokens:
+            hay = " ".join(filter(None, [title, prof, lv_id, fallback_full]))
+            hay_n = _norm(hay)
+            if not all(t in hay_n for t in tokens):
+                continue
             waitlist = (span.get_text(" ", strip=True)
                         if span else wl_div.get_text(" ", strip=True)).strip()
 
@@ -244,6 +227,7 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             "status": status,
             "capacity": cap_val,
             "free": free_val,
+            "waitlist": waitlist,
             "waitlist": waitlist,             # original label
             "waitlist_count": waitlist_count, # integer count
             "enroll_open_at": enroll_open_at, # ISO timestamp or raw
@@ -554,21 +538,6 @@ def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
     res2 = client.browser.open(client.URL_scraped + dlvo_href)
     return BeautifulSoup(res2.read(), "html.parser")
 
-def extract_form_meta(soup: BeautifulSoup) -> Optional[Dict[str,Any]]:
-    form = soup.find("form", {"name": re.compile(r"anmeld|enroll", re.I)})
-    if not form: 
-        return None
-    action = form.get("action")
-    hidden = {inp["name"]: inp.get("value","") 
-              for inp in form.find_all("input", type="hidden") if inp.get("name")}
-    return {"action": action, "hidden": hidden}
-
-# …inside your /courses/reindex_sync or full‐index builder, after grabbing soup_lv…
-meta = extract_form_meta(soup_lv)
-if meta:
-    cache_enroll_form(username, pp_id, lv_id, meta)
-
-
 def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
                               group_id: Optional[str], auto_waitlist: bool) -> Dict[str, Any]:
     """
@@ -723,17 +692,17 @@ def root():
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-    
+
 @app.post("/courses/reindex_sync")
 def courses_reindex_sync(p: ReindexIn):
     if not p.username or not p.password:
         raise HTTPException(status_code=400, detail="Missing credentials")
-    
+
     try:
         print(f"[reindex_sync] Starting full build for {p.username}")
         start = _now()
         items = _build_index(p.username, p.password)
-        
+
         with _CACHE_LOCK:
             _CACHE[p.username] = {
                 "items": items,
@@ -743,12 +712,12 @@ def courses_reindex_sync(p: ReindexIn):
                 "build_started": start,
                 "build_finished": _now(),
             }
-        
+
         elapsed_ms = int((_now() - start) * 1000)
         print(f"[reindex_sync] Built {len(items)} items in {elapsed_ms} ms for {p.username}")
-        
+
         return {"ok": True, "seeded": len(items), "ms": elapsed_ms}
-    
+
     except Exception as e:
         tb = traceback.format_exc(limit=5)
         print(f"[reindex_sync] Error: {e}\n{tb}")
