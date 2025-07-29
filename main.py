@@ -179,19 +179,37 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             except Exception:
                 pass
 
+        # ─── original waitlist string ────────────────────────────────
         waitlist = None
         wl_div = row.select_one('td.capacity div[title*="Anzahl Warteliste"]')
         if wl_div:
             span = wl_div.find("span")
-            waitlist = (span.get_text(" ", strip=True) if span else wl_div.get_text(" ", strip=True)).strip()
+            waitlist = (span.get_text(" ", strip=True)
+                        if span else wl_div.get_text(" ", strip=True)).strip()
 
-        # ---- matching ----
-        if tokens:
-            hay = " ".join(filter(None, [title, prof, lv_id, fallback_full]))
-            hay_n = _norm(hay)
-            if not all(t in hay_n for t in tokens):
-                continue
+        # ─── parse waitlist_count as integer ──────────────────────────
+        try:
+            waitlist_count = int(''.join(filter(str.isdigit, waitlist))) if waitlist else 0
+        except Exception:
+            waitlist_count = 0
 
+        # ─── parse enroll_open_at timestamp from "ab DD.MM.YYYY HH:MM" ─
+        enroll_open_at = None
+        action_td = row.select_one("td.action")
+        if action_td:
+            txt = action_td.get_text(" ", strip=True)
+            m = re.search(r"ab\s*(\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2})", txt)
+            if m:
+                # convert "18.08.2025 15:00" → "2025-08-18T15:00:00Z"
+                try:
+                    day, month, year_time = m.group(1).split('.', 2)
+                    year, timepart = year_time.split(' ',1)
+                    dt_iso = f"{year}-{month}-{day}T{timepart}:00Z"
+                    enroll_open_at = dt_iso
+                except:
+                    enroll_open_at = m.group(1)  # fallback raw string
+
+        # ─── append item with new fields ──────────────────────────────
         out.append({
             "pp": str(pp_id),
             "lv": str(lv_id),
@@ -201,8 +219,11 @@ def _parse_lv_rows_fast(pp_id: str, soup_lv: BeautifulSoup, tokens: List[str],
             "status": status,
             "capacity": cap_val,
             "free": free_val,
-            "waitlist": waitlist,
+            "waitlist": waitlist,             # original label
+            "waitlist_count": waitlist_count, # integer count
+            "enroll_open_at": enroll_open_at, # ISO timestamp or raw
         })
+
 
         if cap and len(out) >= cap:
             return True
