@@ -11,6 +11,31 @@ import socket
 import contextlib
 import re
 import time
+import requests, threading, time
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+
+# Thread‑safe in‑memory caches
+_SESSION_CACHE: Dict[str, requests.Session] = {}
+_FORM_CACHE: Dict[Tuple[str,str,str], Dict[str,Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+def get_http_session(username: str) -> requests.Session:
+    with _CACHE_LOCK:
+        if username not in _SESSION_CACHE:
+            sess = requests.Session()
+            # optional: configure retries / keep‑alive here
+            _SESSION_CACHE[username] = sess
+        return _SESSION_CACHE[username]
+
+def cache_enroll_form(username: str, pp: str, lv: str, form_meta: Dict[str,Any]):
+    key = (username, pp, lv)
+    with _CACHE_LOCK:
+        _FORM_CACHE[key] = { **form_meta, "ts": time.time() }
+
+def get_cached_form(username: str, pp: str, lv: str) -> Optional[Dict[str,Any]]:
+    return _FORM_CACHE.get((username,pp,lv))
+
 
 # ---------- Global network defaults ----------
 # Hard default so requests can't hang forever (used outside provisional path)
@@ -528,6 +553,21 @@ def _reach_pp_lv_page(client, pp_id: str) -> BeautifulSoup:
 
     res2 = client.browser.open(client.URL_scraped + dlvo_href)
     return BeautifulSoup(res2.read(), "html.parser")
+
+def extract_form_meta(soup: BeautifulSoup) -> Optional[Dict[str,Any]]:
+    form = soup.find("form", {"name": re.compile(r"anmeld|enroll", re.I)})
+    if not form: 
+        return None
+    action = form.get("action")
+    hidden = {inp["name"]: inp.get("value","") 
+              for inp in form.find_all("input", type="hidden") if inp.get("name")}
+    return {"action": action, "hidden": hidden}
+
+# …inside your /courses/reindex_sync or full‐index builder, after grabbing soup_lv…
+meta = extract_form_meta(soup_lv)
+if meta:
+    cache_enroll_form(username, pp_id, lv_id, meta)
+
 
 def _submit_enroll_on_lv_page(client, soup_lv: BeautifulSoup, lv_id: str,
                               group_id: Optional[str], auto_waitlist: bool) -> Dict[str, Any]:
